@@ -86,9 +86,12 @@ cp config.example.json config.json
 | `proxy` | 代理地址，可留空 |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
 | `cloudflare_api_base` | Cloudflare 临时邮箱 API 地址 |
-| `cloudflare_api_key` | Cloudflare 临时邮箱接口密钥；admin 模式填 `ADMIN_PASSWORD` |
-| `cloudflare_auth_mode` | Cloudflare API 鉴权模式：`none`、`bearer`、`x-api-key`、`x-admin-auth`、`query-key` |
-| `cloudflare_path_accounts` | Cloudflare 创建邮箱路径；匿名模式用 `/api/new_address`，admin 模式用 `/admin/new_address` |
+| `cloudflare_api_key` | Cloudflare 临时邮箱接口密钥；默认匿名模式留空，admin 模式填 `ADMIN_PASSWORD` |
+| `cloudflare_auth_mode` | Cloudflare API 鉴权模式；默认 `none`，可选 `bearer`、`x-api-key`、`x-admin-auth`、`query-key` |
+| `cloudflare_path_domains` | Cloudflare 域名列表路径；默认 `/api/domains` |
+| `cloudflare_path_accounts` | Cloudflare 创建邮箱路径；默认匿名模式用 `/api/new_address`，admin 模式用 `/admin/new_address` |
+| `cloudflare_path_token` | Cloudflare token 路径；默认 `/api/token` |
+| `cloudflare_path_messages` | Cloudflare 收件列表路径；默认 `/api/mails` |
 | `defaultDomains` | Cloudflare 临时邮箱默认域名 |
 | `grok2api_auto_add_local` | 是否写入本地 grok2api token 池 |
 | `grok2api_local_token_file` | 本地 grok2api token 文件路径 |
@@ -96,7 +99,32 @@ cp config.example.json config.json
 | `grok2api_remote_base` | 远端 grok2api 地址，可填站点根地址或 `/admin/api` 管理 API 地址 |
 | `grok2api_remote_app_key` | 远端 grok2api app key |
 
-### Cloudflare 临时邮箱 admin 模式
+### Cloudflare 临时邮箱匿名模式（默认）
+
+默认情况下，Cloudflare 邮箱使用 `dreamhunter2333/cloudflare_temp_email` 的匿名接口创建邮箱并读取邮件：
+
+- 创建邮箱：`POST /api/new_address`
+- 读取邮件：`GET /api/mails`
+- 鉴权模式：`none`
+- `cloudflare_api_key`：留空
+
+这是项目的默认路线。没有特殊需求时，保持下面配置即可：
+
+```json
+{
+  "email_provider": "cloudflare",
+  "cloudflare_api_base": "https://你的-worker-api-域名",
+  "cloudflare_api_key": "",
+  "cloudflare_auth_mode": "none",
+  "cloudflare_path_domains": "/api/domains",
+  "cloudflare_path_accounts": "/api/new_address",
+  "cloudflare_path_token": "/api/token",
+  "cloudflare_path_messages": "/api/mails",
+  "defaultDomains": "你的收信域名.com"
+}
+```
+
+### Cloudflare 临时邮箱 admin 模式（可选）
 
 如果使用 `dreamhunter2333/cloudflare_temp_email` 且匿名 `/api/new_address` 开启了 Turnstile，可以改用 admin 创建邮箱接口：
 
@@ -112,13 +140,37 @@ cp config.example.json config.json
 }
 ```
 
-创建邮箱会使用 `x-admin-auth` 调用 `/admin/new_address`，后续收件仍使用接口返回的地址 JWT 调用 `/api/mails`。
+创建邮箱会使用 `x-admin-auth` 调用 `/admin/new_address`，后续收件仍使用接口返回的地址 JWT 调用 `/api/mails`。也就是说，admin 密码只用于创建邮箱，不用于读取邮箱邮件。
 
 可先用调试脚本验证 admin 创建接口：
 
 ```bash
 python cf_mail_debug.py --api-base "https://你的-worker-api-域名" --auth-mode x-admin-auth --api-key "你的 ADMIN_PASSWORD" --create-path /admin/new_address --domain "你的收信域名.com"
 ```
+
+### grok2api 远端入池配置
+
+如果开启 `grok2api_auto_add_remote`，`grok2api_remote_base` 可以填写站点根地址，也可以直接填写管理 API 地址：
+
+```json
+{
+  "grok2api_auto_add_remote": true,
+  "grok2api_remote_base": "https://你的-grok2api-域名",
+  "grok2api_remote_app_key": "你的 app_key"
+}
+```
+
+或：
+
+```json
+{
+  "grok2api_auto_add_remote": true,
+  "grok2api_remote_base": "https://你的-grok2api-域名/admin/api",
+  "grok2api_remote_app_key": "你的 app_key"
+}
+```
+
+程序会优先尝试 `/tokens/add`，并兼容 `/admin/api/tokens/add`；旧版全量保存接口也会兼容 `/tokens` 和 `/admin/api/tokens`。
 
 `config.json` 包含个人配置和密钥，不要提交到 Git。
 
