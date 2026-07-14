@@ -59,6 +59,7 @@ def ensure_line(content, line):
     return content
 
 
+# Trigger token: audit-fixes-v4
 # ---------------------------------------------------------------------------
 # Main application fixes.
 # ---------------------------------------------------------------------------
