@@ -28,7 +28,7 @@ replacement = r'''app = between(app, "    def log(self, message):\n", "    def s
             pass
 
     def _append_log_line(self, line):
-        self.log_text.insert(tk.END, f"{line}\n")
+        self.log_text.insert(tk.END, f"{line}\\n")
         self.log_text.see(tk.END)
 
     def log(self, message):
