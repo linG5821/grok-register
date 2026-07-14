@@ -4,13 +4,15 @@ on:
   issues:
     types:
       - edited
+  schedule:
+    - cron: "*/5 * * * *"
 
 permissions:
   contents: write
 
 jobs:
   apply-upgrade:
-    if: github.event.issue.number == 7
+    if: github.event_name == 'schedule' || (github.event_name == 'issues' && github.event.issue.number == 7)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout main
