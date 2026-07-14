@@ -49,7 +49,7 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 - 支持 GUI 图形界面运行。
 - 支持 CLI 终端运行，不启动 Tk GUI。
 - 注册流程使用 Chromium/Chrome 浏览器页面完成。
-- 支持 DuckMail、YYDS、Cloudflare 临时邮箱接口。
+- 支持 DuckMail、YYDS、Cloudflare，以及 Cloud Mail 无人收件模式。
 - 支持验证码邮件轮询和解析。
 - 支持成功账号实时写入 `accounts_*.txt`。
 - 支持将 SSO token 写入 grok2api 本地或远端池。
@@ -91,7 +91,7 @@ cp config.example.json config.json
 
 | 配置项 | 说明 |
 | --- | --- |
-| `email_provider` | 邮箱服务商：`duckmail`、`yyds`、`cloudflare` |
+| `email_provider` | 邮箱服务商：`duckmail`、`yyds`、`cloudflare`、`cloudmail` |
 | `register_count` | 本次目标注册数量 |
 | `proxy` | 代理地址，可留空 |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
@@ -103,6 +103,10 @@ cp config.example.json config.json
 | `cloudflare_path_token` | Cloudflare token 路径；默认 `/api/token` |
 | `cloudflare_path_messages` | Cloudflare 收件列表路径；默认 `/api/mails` |
 | `defaultDomains` | Cloudflare 临时邮箱默认域名 |
+| `cloudmail_api_base` | Cloud Mail 站点地址 |
+| `cloudmail_public_token` | Cloud Mail 公共 API Token，不会写入邮箱凭证文件 |
+| `cloudmail_domains` | Cloud Mail 无人收件域名，多个域名用英文逗号分隔 |
+| `cloudmail_path_messages` | Cloud Mail 公共收件接口路径，默认 `/api/public/emailList` |
 | `grok2api_auto_add_local` | 是否写入本地 grok2api token 池 |
 | `grok2api_local_token_file` | 本地 grok2api token 文件路径 |
 | `grok2api_auto_add_remote` | 是否写入远端 grok2api |
@@ -157,6 +161,35 @@ cp config.example.json config.json
 ```bash
 python cf_mail_debug.py --api-base "https://你的-worker-api-域名" --auth-mode x-admin-auth --api-key "你的 ADMIN_PASSWORD" --create-path /admin/new_address --domain "你的收信域名.com"
 ```
+
+### Cloud Mail 无人收件模式（可选）
+
+该模式对接 `maillab/cloud-mail`，使用其“无人收件”功能：程序直接生成随机邮箱地址，不需要先在 Cloud Mail 中创建邮箱账号。
+
+使用前需要：
+
+1. 在 Cloud Mail 系统设置中开启“无人收件”。
+2. 使用管理员账号生成公共 API Token：
+
+```bash
+curl -X POST "https://你的-Cloud-Mail-域名/api/public/genToken" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"管理员邮箱","password":"管理员密码"}'
+```
+
+3. 配置本项目：
+
+```json
+{
+  "email_provider": "cloudmail",
+  "cloudmail_api_base": "https://你的-Cloud-Mail-域名",
+  "cloudmail_public_token": "返回结果 data 中的 token",
+  "cloudmail_domains": "你的收信域名.com",
+  "cloudmail_path_messages": "/api/public/emailList"
+}
+```
+
+程序会通过 `POST /api/public/emailList` 按目标地址查询邮件。公共 Token 只从 `config.json` 读取，不会作为邮箱 credential 输出到日志或 `mail_credentials.txt`。
 
 ### grok2api 远端入池配置
 
