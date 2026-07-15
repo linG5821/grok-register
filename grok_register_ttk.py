@@ -64,6 +64,12 @@ DEFAULT_CONFIG = {
     "grok2api_auto_add_remote": False,
     "grok2api_remote_base": "",
     "grok2api_remote_app_key": "",
+    "chenyme_grok2api_enabled": False,
+    "chenyme_grok2api_base": "",
+    "chenyme_grok2api_username": "",
+    "chenyme_grok2api_password": "",
+    "chenyme_grok2api_convert": True,
+    "chenyme_grok2api_convert_strategy": "missing",
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -705,6 +711,176 @@ def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] 写入 grok2api 远端池失败: {exc}")
+
+
+_chenyme_access_token = ""
+_chenyme_access_token_expires_at = None
+
+
+def chenyme_clear_token_cache():
+    global _chenyme_access_token, _chenyme_access_token_expires_at
+    _chenyme_access_token = ""
+    _chenyme_access_token_expires_at = None
+
+
+def _chenyme_normalize_base(base):
+    return str(base or "").strip().rstrip("/")
+
+
+def _chenyme_parse_expires_at(raw_value):
+    text = str(raw_value or "").strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        return datetime.datetime.fromisoformat(text)
+    except Exception:
+        return None
+
+
+def chenyme_login(log_callback=None):
+    global _chenyme_access_token, _chenyme_access_token_expires_at
+    base = _chenyme_normalize_base(config.get("chenyme_grok2api_base", ""))
+    username = str(config.get("chenyme_grok2api_username", "") or "").strip()
+    password = str(config.get("chenyme_grok2api_password", "") or "").strip()
+    if not base or not username or not password:
+        raise RuntimeError("chenyme grok2api 未配置 base/username/password")
+    endpoint = f"{base}/api/admin/v1/auth/login"
+    resp = http_post(
+        endpoint,
+        headers={"Content-Type": "application/json"},
+        json={"username": username, "password": password},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    payload = resp.json() if hasattr(resp, "json") else {}
+    data = payload.get("data") if isinstance(payload, dict) else None
+    tokens = data.get("tokens") if isinstance(data, dict) else None
+    access_token = ""
+    expires_at = None
+    if isinstance(tokens, dict):
+        access_token = str(tokens.get("accessToken") or "").strip()
+        expires_at = _chenyme_parse_expires_at(tokens.get("accessTokenExpiresAt"))
+    if not access_token:
+        raise RuntimeError("chenyme 登录响应缺少 accessToken")
+    if expires_at is None:
+        expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=50)
+    elif expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=datetime.timezone.utc)
+    _chenyme_access_token = access_token
+    _chenyme_access_token_expires_at = expires_at
+    if log_callback:
+        log_callback("[*] chenyme grok2api 登录成功")
+    return access_token
+
+
+def chenyme_get_access_token(log_callback=None, force_refresh=False):
+    global _chenyme_access_token, _chenyme_access_token_expires_at
+    if not force_refresh and _chenyme_access_token and _chenyme_access_token_expires_at:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        expires = _chenyme_access_token_expires_at
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=datetime.timezone.utc)
+        if expires > now + datetime.timedelta(seconds=60):
+            return _chenyme_access_token
+    return chenyme_login(log_callback=log_callback)
+
+
+def _chenyme_auth_headers(access_token, content_type=None):
+    headers = {"Authorization": f"Bearer {access_token}"}
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
+
+
+def _chenyme_is_unauthorized(resp):
+    return getattr(resp, "status_code", 0) == 401
+
+
+def chenyme_import_sso(raw_token, log_callback=None):
+    token = _normalize_sso_token(raw_token)
+    if not token:
+        return False
+    base = _chenyme_normalize_base(config.get("chenyme_grok2api_base", ""))
+    if not base:
+        return False
+    endpoint = f"{base}/api/admin/v1/accounts/web/import"
+    for attempt in range(2):
+        access_token = chenyme_get_access_token(
+            log_callback=log_callback,
+            force_refresh=(attempt > 0),
+        )
+        files = {
+            "files": ("grok-web-sso-tokens.txt", token, "text/plain"),
+        }
+        resp = http_post(
+            endpoint,
+            headers=_chenyme_auth_headers(access_token),
+            files=files,
+            timeout=60,
+        )
+        if _chenyme_is_unauthorized(resp) and attempt == 0:
+            chenyme_clear_token_cache()
+            continue
+        resp.raise_for_status()
+        _ = getattr(resp, "text", "") or ""
+        if log_callback:
+            log_callback(f"[+] chenyme 已导入 SSO ({endpoint})")
+        return True
+    return False
+
+
+def chenyme_convert_to_build(log_callback=None):
+    base = _chenyme_normalize_base(config.get("chenyme_grok2api_base", ""))
+    if not base:
+        return False
+    strategy = str(config.get("chenyme_grok2api_convert_strategy", "missing") or "missing").strip() or "missing"
+    endpoint = f"{base}/api/admin/v1/accounts/web/convert-to-build"
+    body = {"all": True, "strategy": strategy}
+    for attempt in range(2):
+        access_token = chenyme_get_access_token(
+            log_callback=log_callback,
+            force_refresh=(attempt > 0),
+        )
+        resp = http_post(
+            endpoint,
+            headers=_chenyme_auth_headers(access_token, content_type="application/json"),
+            json=body,
+            timeout=120,
+        )
+        if _chenyme_is_unauthorized(resp) and attempt == 0:
+            chenyme_clear_token_cache()
+            continue
+        resp.raise_for_status()
+        _ = getattr(resp, "text", "") or ""
+        if log_callback:
+            log_callback("[+] chenyme convert-to-build 完成")
+        return True
+    return False
+
+
+def add_token_to_chenyme_grok2api(raw_token, email="", log_callback=None):
+    if not config.get("chenyme_grok2api_enabled", False):
+        return False
+    base = _chenyme_normalize_base(config.get("chenyme_grok2api_base", ""))
+    username = str(config.get("chenyme_grok2api_username", "") or "").strip()
+    password = str(config.get("chenyme_grok2api_password", "") or "").strip()
+    if not base or not username or not password:
+        if log_callback:
+            log_callback("[Debug] chenyme grok2api 未配置 base/账号，跳过")
+        return False
+    try:
+        imported = chenyme_import_sso(raw_token, log_callback=log_callback)
+        if not imported:
+            return False
+        if config.get("chenyme_grok2api_convert", True):
+            chenyme_convert_to_build(log_callback=log_callback)
+        return True
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] chenyme grok2api 导入失败: {exc}")
+        return False
 
 
 def apply_browser_proxy_option(options, proxy):
@@ -1916,7 +2092,7 @@ function textOf(node) {
         node.getAttribute('name'),
         node.getAttribute('id'),
         node.getAttribute('autocomplete'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+    ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
 }
 function describeInput(node) {
     return [
@@ -1926,7 +2102,7 @@ function describeInput(node) {
         `placeholder=${node.getAttribute('placeholder') || ''}`,
         `aria=${node.getAttribute('aria-label') || ''}`,
         `testid=${node.getAttribute('data-testid') || ''}`,
-    ].join(' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+    ].join(' ').replace(/\\s+/g, ' ').trim().slice(0, 160);
 }
 function describeAction(node) {
     return textOf(node).slice(0, 120);
@@ -2925,6 +3101,31 @@ class GrokRegisterGUI:
         self.grok2api_remote_key_entry = tk_entry(config_frame, textvariable=self.grok2api_remote_key_var, width=72)
         add_field(self.grok2api_remote_key_entry, 9, 1, columnspan=3)
 
+        add_label(10, 0, "chenyme 自动导入:")
+        self.chenyme_enabled_var = tk.BooleanVar(value=bool(config.get("chenyme_grok2api_enabled", False)))
+        self.chenyme_enabled_check = tk_checkbutton(config_frame, variable=self.chenyme_enabled_var)
+        add_field(self.chenyme_enabled_check, 10, 1, sticky=tk.W)
+
+        add_label(10, 2, "导入后 convert:")
+        self.chenyme_convert_var = tk.BooleanVar(value=bool(config.get("chenyme_grok2api_convert", True)))
+        self.chenyme_convert_check = tk_checkbutton(config_frame, variable=self.chenyme_convert_var)
+        add_field(self.chenyme_convert_check, 10, 3, sticky=tk.W)
+
+        add_label(11, 0, "chenyme Base:")
+        self.chenyme_base_var = tk.StringVar(value=str(config.get("chenyme_grok2api_base", "")))
+        self.chenyme_base_entry = tk_entry(config_frame, textvariable=self.chenyme_base_var, width=72)
+        add_field(self.chenyme_base_entry, 11, 1, columnspan=3)
+
+        add_label(12, 0, "chenyme 用户名:")
+        self.chenyme_username_var = tk.StringVar(value=str(config.get("chenyme_grok2api_username", "")))
+        self.chenyme_username_entry = tk_entry(config_frame, textvariable=self.chenyme_username_var, width=34)
+        add_field(self.chenyme_username_entry, 12, 1)
+
+        add_label(12, 2, "chenyme 密码:")
+        self.chenyme_password_var = tk.StringVar(value=str(config.get("chenyme_grok2api_password", "")))
+        self.chenyme_password_entry = tk_entry(config_frame, textvariable=self.chenyme_password_var, width=34, show="*")
+        add_field(self.chenyme_password_entry, 12, 3)
+
         btn_frame = tk.Frame(main_frame, bg=UI_BG)
         btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
         self.start_btn = tk_button(btn_frame, text="开始注册", command=self.start_registration)
@@ -3014,6 +3215,11 @@ class GrokRegisterGUI:
         config["grok2api_auto_add_remote"] = bool(self.grok2api_remote_auto_var.get())
         config["grok2api_remote_base"] = self.grok2api_remote_base_var.get().strip()
         config["grok2api_remote_app_key"] = self.grok2api_remote_key_var.get().strip()
+        config["chenyme_grok2api_enabled"] = bool(self.chenyme_enabled_var.get())
+        config["chenyme_grok2api_convert"] = bool(self.chenyme_convert_var.get())
+        config["chenyme_grok2api_base"] = self.chenyme_base_var.get().strip()
+        config["chenyme_grok2api_username"] = self.chenyme_username_var.get().strip()
+        config["chenyme_grok2api_password"] = self.chenyme_password_var.get().strip()
         raw_paths = [x.strip() for x in self.cloudflare_paths_var.get().split(",") if x.strip()]
         if len(raw_paths) >= 4:
             config["cloudflare_path_domains"] = raw_paths[0] if raw_paths[0].startswith("/") else ("/" + raw_paths[0])
@@ -3138,6 +3344,7 @@ class GrokRegisterGUI:
                     except Exception as file_exc:
                         self.log(f"[Debug] 保存账号文件失败: {file_exc}")
                     add_token_to_grok2api_pools(sso, email=email, log_callback=self.log)
+                    add_token_to_chenyme_grok2api(sso, email=email, log_callback=self.log)
                     self.success_count += 1
                     retry_count_for_slot = 0
                     i += 1
@@ -3298,6 +3505,7 @@ def run_registration_cli(count):
                 except Exception as file_exc:
                     cli_log(f"[Debug] 保存账号文件失败: {file_exc}")
                 add_token_to_grok2api_pools(sso, email=email, log_callback=cli_log)
+                add_token_to_chenyme_grok2api(sso, email=email, log_callback=cli_log)
                 success_count += 1
                 retry_count_for_slot = 0
                 i += 1

@@ -108,6 +108,12 @@ cp config.example.json config.json
 | `grok2api_auto_add_remote` | 是否写入远端 grok2api |
 | `grok2api_remote_base` | 远端 grok2api 地址，可填站点根地址或 `/admin/api` 管理 API 地址 |
 | `grok2api_remote_app_key` | 远端 grok2api app key |
+| `chenyme_grok2api_enabled` | 是否写入 chenyme 作者的 grok2api（登录后 import + 可选 convert） |
+| `chenyme_grok2api_base` | chenyme grok2api 站点根地址，如 `http://192.168.x.x:31101` |
+| `chenyme_grok2api_username` | chenyme 管理后台用户名 |
+| `chenyme_grok2api_password` | chenyme 管理后台密码 |
+| `chenyme_grok2api_convert` | import 后是否调用 convert-to-build |
+| `chenyme_grok2api_convert_strategy` | convert strategy，默认 `missing` |
 
 ### Cloudflare 临时邮箱匿名模式（默认）
 
@@ -181,6 +187,25 @@ python cf_mail_debug.py --api-base "https://你的-worker-api-域名" --auth-mod
 ```
 
 程序会优先尝试 `/tokens/add`，并兼容 `/admin/api/tokens/add`；旧版全量保存接口也会兼容 `/tokens` 和 `/admin/api/tokens`。
+
+### chenyme grok2api 自动导入
+
+与上方「另一套」grok2api 远端入池相互独立，可同时开启。开启后，每个账号注册成功会：
+
+1. 登录 chenyme 管理接口获取 `accessToken`
+2. multipart 导入纯 SSO（一行一个）
+3. 若 `chenyme_grok2api_convert` 为 true，调用 convert-to-build（`{"all":true,"strategy":"..."}`）
+
+```json
+{
+  "chenyme_grok2api_enabled": true,
+  "chenyme_grok2api_base": "http://192.168.8.228:31101",
+  "chenyme_grok2api_username": "admin",
+  "chenyme_grok2api_password": "你的密码",
+  "chenyme_grok2api_convert": true,
+  "chenyme_grok2api_convert_strategy": "missing"
+}
+```
 
 `config.json` 包含个人配置和密钥，不要提交到 Git。
 
