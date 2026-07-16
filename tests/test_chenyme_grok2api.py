@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import grok_register_ttk as app
 
@@ -17,6 +17,18 @@ class DummyResponse:
 
     def json(self):
         return self._payload
+
+
+class DummyCurlMime:
+    def __init__(self):
+        self.parts = []
+
+    def addpart(self, **kwargs):
+        self.parts.append(kwargs)
+        return self
+
+    def close(self):
+        pass
 
 
 class ChenymeGrok2ApiTests(unittest.TestCase):
@@ -38,17 +50,21 @@ class ChenymeGrok2ApiTests(unittest.TestCase):
 
     def test_disabled_skips_http(self):
         app.config["chenyme_grok2api_enabled"] = False
-        with patch.object(app, "http_post") as mock_post:
+        with patch.object(app, "http_post") as mock_post, \
+                patch.object(app.requests, "post") as mock_req:
             ok = app.add_token_to_chenyme_grok2api("sso=abc123", email="a@example.com")
         self.assertFalse(ok)
         mock_post.assert_not_called()
+        mock_req.assert_not_called()
 
     def test_missing_config_skips(self):
         app.config["chenyme_grok2api_base"] = ""
-        with patch.object(app, "http_post") as mock_post:
+        with patch.object(app, "http_post") as mock_post, \
+                patch.object(app.requests, "post") as mock_req:
             ok = app.add_token_to_chenyme_grok2api("sso=abc123", email="a@example.com")
         self.assertFalse(ok)
         mock_post.assert_not_called()
+        mock_req.assert_not_called()
 
     def test_login_and_cache(self):
         calls = []
@@ -74,10 +90,10 @@ class ChenymeGrok2ApiTests(unittest.TestCase):
         self.assertTrue(calls[0].endswith("/api/admin/v1/auth/login"))
 
     def test_import_multipart_sends_pure_sso(self):
-        post_calls = []
+        req_calls = []
 
-        def fake_post(url, **kwargs):
-            post_calls.append((url, kwargs))
+        def fake_req_post(url, **kwargs):
+            req_calls.append((url, kwargs))
             if url.endswith("/auth/login"):
                 return DummyResponse({
                     "data": {
@@ -89,27 +105,44 @@ class ChenymeGrok2ApiTests(unittest.TestCase):
                 })
             return DummyResponse(text="event: done\ndata: ok\n\n")
 
-        with patch.object(app, "http_post", side_effect=fake_post):
+        def fake_http_post(url, **kwargs):
+            req_calls.append((url, kwargs))
+            return DummyResponse({
+                "data": {
+                    "tokens": {
+                        "accessToken": "jwt-abc",
+                        "accessTokenExpiresAt": "2099-01-01T00:00:00Z",
+                    }
+                }
+            })
+
+        fake_mime = DummyCurlMime()
+        with patch.object(app, "CurlMime", return_value=fake_mime), \
+                patch.object(app.requests, "post", side_effect=fake_req_post), \
+                patch.object(app, "http_post", side_effect=fake_http_post):
             ok = app.chenyme_import_sso("sso=rawtokenvalue")
 
         self.assertTrue(ok)
-        import_calls = [c for c in post_calls if c[0].endswith("/accounts/web/import")]
+        import_calls = [c for c in req_calls if c[0].endswith("/accounts/web/import")]
         self.assertEqual(len(import_calls), 1)
         url, kwargs = import_calls[0]
         self.assertEqual(url, "http://192.168.8.228:31101/api/admin/v1/accounts/web/import")
         self.assertEqual(kwargs["headers"]["Authorization"], "Bearer jwt-abc")
-        files = kwargs["files"]
-        self.assertIn("files", files)
-        field = files["files"]
-        self.assertEqual(field[0], "grok-web-sso-tokens.txt")
-        self.assertEqual(field[1], "rawtokenvalue")
-        self.assertEqual(field[2], "text/plain")
+        self.assertEqual(kwargs["timeout"], 60)
+        self.assertIn("multipart", kwargs)
+        self.assertEqual(len(fake_mime.parts), 1)
+        self.assertEqual(fake_mime.parts[0]["name"], "files")
+        self.assertEqual(fake_mime.parts[0]["filename"], "grok-web-sso-tokens.txt")
+        self.assertEqual(fake_mime.parts[0]["content_type"], "text/plain")
+        self.assertEqual(fake_mime.parts[0]["data"], b"rawtokenvalue")
 
     def test_import_401_refreshes_and_retries(self):
         login_count = {"n": 0}
         import_status = {"n": 0}
+        req_calls = []
 
-        def fake_post(url, **kwargs):
+        def fake_req_post(url, **kwargs):
+            req_calls.append(url)
             if url.endswith("/auth/login"):
                 login_count["n"] += 1
                 return DummyResponse({
@@ -127,7 +160,10 @@ class ChenymeGrok2ApiTests(unittest.TestCase):
                 return DummyResponse(text="ok")
             return DummyResponse(status_code=404)
 
-        with patch.object(app, "http_post", side_effect=fake_post):
+        fake_mime = DummyCurlMime()
+        with patch.object(app, "CurlMime", return_value=fake_mime), \
+                patch.object(app.requests, "post", side_effect=fake_req_post), \
+                patch.object(app, "http_post", side_effect=fake_req_post):
             ok = app.chenyme_import_sso("token-xyz")
 
         self.assertTrue(ok)
@@ -161,10 +197,11 @@ class ChenymeGrok2ApiTests(unittest.TestCase):
         self.assertEqual(kwargs["headers"]["Authorization"], "Bearer jwt-c")
 
     def test_orchestrator_import_and_convert(self):
-        urls = []
+        post_calls = []
+        req_calls = []
 
-        def fake_post(url, **kwargs):
-            urls.append(url)
+        def fake_http_post(url, **kwargs):
+            post_calls.append(url)
             if url.endswith("/auth/login"):
                 return DummyResponse({
                     "data": {
@@ -176,13 +213,20 @@ class ChenymeGrok2ApiTests(unittest.TestCase):
                 })
             return DummyResponse(text="ok")
 
-        with patch.object(app, "http_post", side_effect=fake_post):
+        def fake_req_post(url, **kwargs):
+            req_calls.append(url)
+            return DummyResponse(text="ok")
+
+        fake_mime = DummyCurlMime()
+        with patch.object(app, "CurlMime", return_value=fake_mime), \
+                patch.object(app.requests, "post", side_effect=fake_req_post), \
+                patch.object(app, "http_post", side_effect=fake_http_post):
             ok = app.add_token_to_chenyme_grok2api("sso=abc", email="a@example.com")
 
         self.assertTrue(ok)
-        self.assertTrue(any(u.endswith("/auth/login") for u in urls))
-        self.assertTrue(any(u.endswith("/accounts/web/import") for u in urls))
-        self.assertTrue(any(u.endswith("/accounts/web/convert-to-build") for u in urls))
+        self.assertTrue(any(u.endswith("/auth/login") for u in post_calls))
+        self.assertTrue(any(u.endswith("/accounts/web/import") for u in req_calls))
+        self.assertTrue(any(u.endswith("/accounts/web/convert-to-build") for u in post_calls))
 
 
 if __name__ == "__main__":

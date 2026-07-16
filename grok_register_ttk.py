@@ -31,7 +31,7 @@ os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
-from curl_cffi import requests
+from curl_cffi import CurlMime, requests
 
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -811,15 +811,22 @@ def chenyme_import_sso(raw_token, log_callback=None):
             log_callback=log_callback,
             force_refresh=(attempt > 0),
         )
-        files = {
-            "files": ("grok-web-sso-tokens.txt", token, "text/plain"),
-        }
-        resp = http_post(
-            endpoint,
+        mp = CurlMime()
+        mp.addpart(
+            name="files",
+            content_type="text/plain",
+            filename="grok-web-sso-tokens.txt",
+            data=token.encode("utf-8"),
+        )
+        request_kwargs = _build_request_kwargs(
             headers=_chenyme_auth_headers(access_token),
-            files=files,
+            multipart=mp,
             timeout=60,
         )
+        try:
+            resp = requests.post(endpoint, **request_kwargs)
+        finally:
+            mp.close()
         if _chenyme_is_unauthorized(resp) and attempt == 0:
             chenyme_clear_token_cache()
             continue
