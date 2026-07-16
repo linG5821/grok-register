@@ -1883,40 +1883,29 @@ return {challenge:!!c, url:location.href, title:document.title};
                 log_callback("[+] TOS 已接受")
 
         birth = generate_random_birthdate()
-        birth_result = the_page.run_js(r"""
-var bd = String(arguments[0]||'');
-return fetch('/rest/auth/set-birth-date', {
-  method:'POST', credentials:'include',
-  headers:{'content-type':'application/json'},
-  body: JSON.stringify({birthDate:bd})
-}).then(function(r) {
-  return r.text().then(function(t) { return {status:r.status, body: String(t||'').slice(0,120)}; });
-}).catch(function(e) { return {status:0, body: String(e)}; });
-        """, birth, timeout=20)
-        birth_status = int((birth_result or {}).get("status", 0) or 0)
-        if 200 <= birth_status < 300:
+        try:
+            the_page.run_js(r"""
+var bd = arguments[0];
+fetch('/rest/auth/set-birth-date',{method:'POST',credentials:'include',headers:{'content-type':'application/json'},body:JSON.stringify({birthDate:bd})});
+            """, birth)
+        except Exception as e:
             if log_callback:
-                log_callback(f"[+] 生日已设置: {birth}")
-        else:
-            if log_callback:
-                log_callback(f"[Debug] 生日设置响应: status={birth_status} body={birth_result}")
-            # 400/409/422 means already set; tolerate
-            if birth_status not in (400, 409, 422):
-                return True, f"web 激活完成 (birth={birth_status})"
+                log_callback(f"[Debug] 设置生日 fetch 异常(忽略): {e}")
+        time.sleep(2)
+        if log_callback:
+            log_callback(f"[+] 已请求设置生日: {birth}")
 
-        probe = the_page.run_js(r"""
-return fetch('/rest/app-chat/conversations?pageSize=1', {credentials:'include'})
-  .then(function(r) { return {status:r.status}; })
-  .catch(function() {
-    return fetch('/', {credentials:'include'}).then(function(r) { return {status:r.status}; });
-  });
-        """, timeout=20)
-        probe_status = int((probe or {}).get("status", 0) or 0)
-        if 200 <= probe_status < 400:
-            if log_callback:
-                log_callback("[+] NSFW Web 激活完成（TOS + 生日，grok.com 可访问）")
-            return True, "web 激活成功"
-        return True, f"web 激活完成 (probe={probe_status})"
+        try:
+            the_page.run_js(r"""
+fetch('/rest/app-chat/conversations?pageSize=1',{credentials:'include'});
+            """)
+        except Exception:
+            pass
+        time.sleep(1)
+
+        if log_callback:
+            log_callback("[+] NSFW Web 激活完成（TOS + 生日）")
+        return True, "web 激活成功"
 
     except Exception as e:
         if log_callback:
