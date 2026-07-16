@@ -1020,6 +1020,31 @@ class GrokRegisterGUI:
         self.cpa_auth_dir_entry = tk_entry(config_frame, textvariable=self.cpa_auth_dir_var, width=34)
         add_field(self.cpa_auth_dir_entry, 12, 3)
 
+        add_label(13, 0, "chenyme 自动导入:")
+        self.chenyme_enabled_var = tk.BooleanVar(value=bool(config.get("chenyme_grok2api_enabled", False)))
+        self.chenyme_enabled_check = tk_checkbutton(config_frame, variable=self.chenyme_enabled_var)
+        add_field(self.chenyme_enabled_check, 13, 1, sticky=tk.W)
+
+        add_label(13, 2, "导入后 convert:")
+        self.chenyme_convert_var = tk.BooleanVar(value=bool(config.get("chenyme_grok2api_convert", True)))
+        self.chenyme_convert_check = tk_checkbutton(config_frame, variable=self.chenyme_convert_var)
+        add_field(self.chenyme_convert_check, 13, 3, sticky=tk.W)
+
+        add_label(14, 0, "chenyme Base:")
+        self.chenyme_base_var = tk.StringVar(value=str(config.get("chenyme_grok2api_base", "")))
+        self.chenyme_base_entry = tk_entry(config_frame, textvariable=self.chenyme_base_var, width=72)
+        add_field(self.chenyme_base_entry, 14, 1, columnspan=3)
+
+        add_label(15, 0, "chenyme 用户名:")
+        self.chenyme_username_var = tk.StringVar(value=str(config.get("chenyme_grok2api_username", "")))
+        self.chenyme_username_entry = tk_entry(config_frame, textvariable=self.chenyme_username_var, width=34)
+        add_field(self.chenyme_username_entry, 15, 1)
+
+        add_label(15, 2, "chenyme 密码:")
+        self.chenyme_password_var = tk.StringVar(value=str(config.get("chenyme_grok2api_password", "")))
+        self.chenyme_password_entry = tk_entry(config_frame, textvariable=self.chenyme_password_var, width=34, show="*")
+        add_field(self.chenyme_password_entry, 15, 3)
+
         btn_frame = tk.Frame(main_frame, bg=UI_BG)
         btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
         self.start_btn = tk_button(btn_frame, text="开始注册", command=self.start_registration)
@@ -1146,6 +1171,11 @@ class GrokRegisterGUI:
         config["grok2api_auto_add_remote"] = bool(self.grok2api_remote_auto_var.get())
         config["grok2api_remote_base"] = self.grok2api_remote_base_var.get().strip()
         config["grok2api_remote_app_key"] = self.grok2api_remote_key_var.get().strip()
+        config["chenyme_grok2api_enabled"] = bool(self.chenyme_enabled_var.get())
+        config["chenyme_grok2api_convert"] = bool(self.chenyme_convert_var.get())
+        config["chenyme_grok2api_base"] = self.chenyme_base_var.get().strip()
+        config["chenyme_grok2api_username"] = self.chenyme_username_var.get().strip()
+        config["chenyme_grok2api_password"] = self.chenyme_password_var.get().strip()
         config["cpa_export_enabled"] = bool(self.cpa_export_var.get())
         config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip() or "./cpa_auths"
         raw_paths = [x.strip() for x in self.cloudflare_paths_var.get().split(",") if x.strip()]
