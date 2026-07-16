@@ -1854,7 +1854,11 @@ return {challenge:!!c, url:location.href, title:document.title};
                 log_callback("[!] grok.com Cloudflare 超时未通过，跳过 NSFW 激活")
             return False, "grok.com CF 超时"
 
-        time.sleep(1.5)
+        try:
+            the_page.wait.doc_loaded(timeout=10)
+        except Exception:
+            pass
+        time.sleep(2)
 
         cf_cookies, user_agent = _extract_grok_cf_cookies(the_page)
         if not cf_cookies or "cf_clearance=" not in cf_cookies:
@@ -1883,18 +1887,32 @@ return {challenge:!!c, url:location.href, title:document.title};
                 log_callback("[+] TOS 已接受")
 
         birth = generate_random_birthdate()
-        try:
-            the_page.run_js(r"""
+        for birth_try in range(3):
+            try:
+                the_page.wait.doc_loaded(timeout=5)
+            except Exception:
+                pass
+            try:
+                the_page.run_js(r"""
 var bd = arguments[0];
 fetch('/rest/auth/set-birth-date',{method:'POST',credentials:'include',headers:{'content-type':'application/json'},body:JSON.stringify({birthDate:bd})});
-            """, birth)
-        except Exception as e:
+                """, birth)
+                break
+            except Exception as e:
+                if log_callback:
+                    log_callback(f"[Debug] 设置生日 fetch 异常({birth_try+1}/3): {e}")
+                time.sleep(2)
+        else:
             if log_callback:
-                log_callback(f"[Debug] 设置生日 fetch 异常(忽略): {e}")
-        time.sleep(2)
+                log_callback("[Debug] 设置生日 fetch 重试耗尽，继续")
+        time.sleep(1)
         if log_callback:
             log_callback(f"[+] 已请求设置生日: {birth}")
 
+        try:
+            the_page.wait.doc_loaded(timeout=5)
+        except Exception:
+            pass
         try:
             the_page.run_js(r"""
 fetch('/rest/app-chat/conversations?pageSize=1',{credentials:'include'});
