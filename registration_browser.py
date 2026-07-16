@@ -161,6 +161,172 @@ def update_nsfw_settings(session, log_callback=None):
         return False, f"update_nsfw_settings 异常: {e}"
 
 def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
+    global page
+
+    sso = str(token or "").strip()
+    if sso.startswith("sso="):
+        sso = sso[4:]
+    if not sso:
+        return False, "token 为空"
+
+    the_page = page
+    if the_page is None:
+        if log_callback:
+            log_callback("[Debug] 无浏览器页面，回退 HTTP 模式")
+        return _enable_nsfw_http(token, cf_clearance=cf_clearance, log_callback=log_callback)
+
+    try:
+        for domain in (".x.ai", "accounts.x.ai", ".grok.com", "grok.com"):
+            for name in ("sso", "sso-rw"):
+                try:
+                    the_page.set.cookies([
+                        {"name": name, "value": sso, "domain": domain, "path": "/", "secure": True}
+                    ])
+                except Exception:
+                    pass
+
+        try:
+            the_page.get("https://grok.com/")
+        except Exception:
+            the_page = refresh_active_page()
+            for domain in (".x.ai", "accounts.x.ai", ".grok.com", "grok.com"):
+                for name in ("sso", "sso-rw"):
+                    try:
+                        the_page.set.cookies([
+                            {"name": name, "value": sso, "domain": domain, "path": "/", "secure": True}
+                        ])
+                    except Exception:
+                        pass
+            the_page.get("https://grok.com/")
+
+        deadline = time.time() + 90
+        cf_ok = False
+        last_click = 0
+        while time.time() < deadline:
+            time.sleep(1)
+            try:
+                state = the_page.run_js(r"""
+var t = String(document.title||'').toLowerCase();
+var b = String(document.body?document.body.innerText||'':'').toLowerCase();
+var c = t.includes('just a moment') || b.includes('verifying you are human') || b.includes('security verification');
+return {challenge:!!c, url:location.href, title:document.title};
+                """) or {}
+            except Exception:
+                continue
+            if not state.get("challenge") and "grok.com" in str(state.get("url", "")).lower():
+                cf_ok = True
+                if log_callback:
+                    log_callback("[*] grok.com 已加载（Cloudflare 已通过）")
+                break
+            now = time.time()
+            if state.get("challenge") and now - last_click >= 5:
+                if _auto_click_cf_turnstile(the_page):
+                    if log_callback:
+                        log_callback("[*] 已自动点击 Turnstile，等待验证...")
+                last_click = now
+
+        if not cf_ok:
+            if log_callback:
+                log_callback("[!] grok.com Cloudflare 超时未通过，跳过 NSFW 激活")
+            return False, "grok.com CF 超时"
+
+        try:
+            the_page.wait.doc_loaded(timeout=10)
+        except Exception:
+            pass
+        time.sleep(2)
+
+        cookies_data = the_page.cookies(all_domains=True, all_info=True) or []
+        cf_parts = []
+        browser_ua = str(the_page.run_js("return navigator.userAgent;") or "").strip()
+        for item in cookies_data:
+            if isinstance(item, dict):
+                n = str(item.get("name", "")).strip()
+                v = str(item.get("value", "")).strip()
+                d = str(item.get("domain", "")).strip().lower().lstrip(".")
+            else:
+                n = str(getattr(item, "name", "")).strip()
+                v = str(getattr(item, "value", "")).strip()
+                d = str(getattr(item, "domain", "")).strip().lower().lstrip(".")
+            if not n or not v:
+                continue
+            if not (d == "grok.com" or d.endswith(".grok.com")):
+                continue
+            if n in {"cf_clearance", "__cf_bm"}:
+                cf_parts.append(f"{n}={v}")
+        cf_cookies_str = "; ".join(cf_parts)
+
+        if not cf_cookies_str or "cf_clearance=" not in cf_cookies_str:
+            if log_callback:
+                log_callback("[!] 未获取到 cf_clearance cookie，尝试继续...")
+
+        proxies = get_proxies()
+        with requests.Session(impersonate="chrome120", proxies=proxies) as session:
+            if cf_cookies_str:
+                for part in cf_cookies_str.split(";"):
+                    n, sep, v = part.strip().partition("=")
+                    if n and v:
+                        session.cookies.set(n, v, domain=".grok.com")
+            for name in ("sso", "sso-rw"):
+                session.cookies.set(name, sso, domain=".x.ai")
+                session.cookies.set(name, sso, domain=".grok.com")
+            if browser_ua:
+                session.headers.update({"user-agent": browser_ua})
+
+            ok, message = set_tos_accepted(session, log_callback)
+            if not ok:
+                if log_callback:
+                    log_callback(f"[!] TOS 接受失败: {message}")
+                return False, message
+            if log_callback:
+                log_callback("[+] TOS 已接受")
+
+        birth = generate_random_birthdate()
+        for birth_try in range(3):
+            try:
+                the_page.wait.doc_loaded(timeout=5)
+            except Exception:
+                pass
+            try:
+                the_page.run_js(r"""
+var bd = arguments[0];
+fetch('/rest/auth/set-birth-date',{method:'POST',credentials:'include',headers:{'content-type':'application/json'},body:JSON.stringify({birthDate:bd})});
+                """, birth)
+                break
+            except Exception as e:
+                if log_callback:
+                    log_callback(f"[Debug] 设置生日 fetch 异常({birth_try+1}/3): {e}")
+                time.sleep(2)
+        else:
+            if log_callback:
+                log_callback("[Debug] 设置生日 fetch 重试耗尽，继续")
+        time.sleep(1)
+        if log_callback:
+            log_callback(f"[+] 已请求设置生日: {birth}")
+
+        try:
+            the_page.wait.doc_loaded(timeout=5)
+        except Exception:
+            pass
+        try:
+            the_page.run_js(r"""
+fetch('/rest/app-chat/conversations?pageSize=1',{credentials:'include'});
+            """)
+        except Exception:
+            pass
+        time.sleep(1)
+
+        if log_callback:
+            log_callback("[+] NSFW Web 激活完成（TOS + 生日）")
+        return True, "web 激活成功"
+
+    except Exception as e:
+        if log_callback:
+            log_callback(f"[Debug] 浏览器 NSFW 异常: {e}")
+        return False, f"浏览器模式异常: {e}"
+
+
+def _enable_nsfw_http(token, cf_clearance="", log_callback=None):
     proxies = get_proxies()
     user_agent = get_user_agent()
     try:
@@ -183,9 +349,60 @@ def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
             ok, message = update_nsfw_settings(session, log_callback)
             if not ok:
                 return False, message
-            return True, "成功开启 NSFW"
+            return True, "成功开启 NSFW (HTTP)"
     except Exception as e:
         return False, f"异常: {str(e)}"
+
+
+def _auto_click_cf_turnstile(the_page):
+    try:
+        token = the_page.run_js(r"""
+var el = document.querySelector('input[name="cf-turnstile-response"]');
+if (el && el.value && el.value.length >= 80) return true;
+if (window.turnstile && typeof turnstile.getResponse === 'function') {
+    var r = turnstile.getResponse();
+    if (r && r.length >= 80) return true;
+}
+return false;
+        """)
+        if token:
+            return True
+    except Exception:
+        pass
+    try:
+        wrapper = the_page.ele("@name=cf-turnstile-response", timeout=0.5)
+    except Exception:
+        return False
+    if wrapper is None:
+        return False
+    try:
+        parent_el = wrapper.parent()
+        iframe = None
+        try:
+            iframe = parent_el.shadow_root.ele("tag:iframe", timeout=1)
+        except Exception:
+            pass
+        if iframe:
+            try:
+                iframe.run_js(r"""
+window.dtp=1;
+function getRandomInt(min,max){return Math.floor(Math.random()*(max-min+1))+min;}
+Object.defineProperty(MouseEvent.prototype,'screenX',{value:getRandomInt(800,1200)});
+Object.defineProperty(MouseEvent.prototype,'screenY',{value:getRandomInt(400,700)});
+                """)
+            except Exception:
+                pass
+            try:
+                body_sr = iframe.ele("tag:body", timeout=1).shadow_root
+                btn = body_sr.ele("tag:input", timeout=1)
+                if btn:
+                    btn.click()
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
 
 def stop_browser_proxy_bridge():
     global browser_proxy_bridge

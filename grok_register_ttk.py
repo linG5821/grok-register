@@ -40,7 +40,7 @@ os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
-from curl_cffi import requests
+from curl_cffi import CurlMime, requests
 
 import functools
 import types
@@ -633,6 +633,169 @@ def retry_pending_file(pending_path, output_path=None, log_callback=None):
     return _retry_pending_file(pending_path, output_path=output_path, log_callback=log_callback)
 
 
+_chenyme_access_token = ""
+_chenyme_access_token_expires_at = None
+
+
+def chenyme_clear_token_cache():
+    global _chenyme_access_token, _chenyme_access_token_expires_at
+    _chenyme_access_token = ""
+    _chenyme_access_token_expires_at = None
+
+
+def _chenyme_normalize_base(base):
+    return str(base or "").strip().rstrip("/")
+
+
+def chenyme_login(log_callback=None):
+    global _chenyme_access_token, _chenyme_access_token_expires_at
+    base = _chenyme_normalize_base(config.get("chenyme_grok2api_base", ""))
+    username = str(config.get("chenyme_grok2api_username", "") or "").strip()
+    password = str(config.get("chenyme_grok2api_password", "") or "").strip()
+    if not base or not username or not password:
+        raise RuntimeError("chenyme grok2api 未配置 base/username/password")
+    endpoint = f"{base}/api/admin/v1/auth/login"
+    resp = http_post(
+        endpoint,
+        headers={"Content-Type": "application/json"},
+        json={"username": username, "password": password},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    payload = resp.json() if hasattr(resp, "json") else {}
+    data = payload.get("data") if isinstance(payload, dict) else None
+    tokens = data.get("tokens") if isinstance(data, dict) else None
+    access_token = ""
+    expires_at = None
+    if isinstance(tokens, dict):
+        access_token = str(tokens.get("accessToken") or "").strip()
+        raw_exp = tokens.get("accessTokenExpiresAt")
+        text = str(raw_exp or "").strip()
+        if text:
+            try:
+                if text.endswith("Z"):
+                    text = text[:-1] + "+00:00"
+                expires_at = datetime.datetime.fromisoformat(text)
+            except Exception:
+                pass
+    if not access_token:
+        raise RuntimeError("chenyme 登录响应缺少 accessToken")
+    if expires_at is None:
+        expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=50)
+    elif expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=datetime.timezone.utc)
+    _chenyme_access_token = access_token
+    _chenyme_access_token_expires_at = expires_at
+    if log_callback:
+        log_callback("[*] chenyme grok2api 登录成功")
+    return access_token
+
+
+def chenyme_get_access_token(log_callback=None, force_refresh=False):
+    global _chenyme_access_token, _chenyme_access_token_expires_at
+    if not force_refresh and _chenyme_access_token and _chenyme_access_token_expires_at:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        expires = _chenyme_access_token_expires_at
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=datetime.timezone.utc)
+        if expires > now + datetime.timedelta(seconds=60):
+            return _chenyme_access_token
+    return chenyme_login(log_callback=log_callback)
+
+
+def chenyme_import_sso(raw_token, log_callback=None):
+    from account_outputs import _normalize_sso_token
+    token = _normalize_sso_token(raw_token)
+    if not token:
+        return False
+    base = _chenyme_normalize_base(config.get("chenyme_grok2api_base", ""))
+    if not base:
+        return False
+    endpoint = f"{base}/api/admin/v1/accounts/web/import"
+    for attempt in range(2):
+        access_token = chenyme_get_access_token(
+            log_callback=log_callback,
+            force_refresh=(attempt > 0),
+        )
+        mp = CurlMime()
+        mp.addpart(
+            name="files",
+            content_type="text/plain",
+            filename="grok-web-sso-tokens.txt",
+            data=token.encode("utf-8"),
+        )
+        try:
+            resp = requests.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {access_token}"},
+                multipart=mp,
+                timeout=60,
+            )
+        finally:
+            mp.close()
+        if resp.status_code == 401 and attempt == 0:
+            chenyme_clear_token_cache()
+            continue
+        resp.raise_for_status()
+        _ = getattr(resp, "text", "") or ""
+        if log_callback:
+            log_callback(f"[+] chenyme 已导入 SSO ({endpoint})")
+        return True
+    return False
+
+
+def chenyme_convert_to_build(log_callback=None):
+    base = _chenyme_normalize_base(config.get("chenyme_grok2api_base", ""))
+    if not base:
+        return False
+    strategy = str(config.get("chenyme_grok2api_convert_strategy", "missing") or "missing").strip() or "missing"
+    endpoint = f"{base}/api/admin/v1/accounts/web/convert-to-build"
+    body = {"all": True, "strategy": strategy}
+    for attempt in range(2):
+        access_token = chenyme_get_access_token(
+            log_callback=log_callback,
+            force_refresh=(attempt > 0),
+        )
+        resp = http_post(
+            endpoint,
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json=body,
+            timeout=120,
+        )
+        if resp.status_code == 401 and attempt == 0:
+            chenyme_clear_token_cache()
+            continue
+        resp.raise_for_status()
+        _ = getattr(resp, "text", "") or ""
+        if log_callback:
+            log_callback("[+] chenyme convert-to-build 完成")
+        return True
+    return False
+
+
+def add_token_to_chenyme_grok2api(raw_token, email="", log_callback=None):
+    if not config.get("chenyme_grok2api_enabled", False):
+        return False
+    base = _chenyme_normalize_base(config.get("chenyme_grok2api_base", ""))
+    username = str(config.get("chenyme_grok2api_username", "") or "").strip()
+    password = str(config.get("chenyme_grok2api_password", "") or "").strip()
+    if not base or not username or not password:
+        if log_callback:
+            log_callback("[Debug] chenyme grok2api 未配置 base/账号，跳过")
+        return False
+    try:
+        imported = chenyme_import_sso(raw_token, log_callback=log_callback)
+        if not imported:
+            return False
+        if config.get("chenyme_grok2api_convert", True):
+            chenyme_convert_to_build(log_callback=log_callback)
+        return True
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] chenyme grok2api 导入失败: {exc}")
+        return False
+
+
 def run_registration_common(count, log_callback, cancel_callback, accounts_output_file, observer):
     from registration_flow import RegistrationCallbacks, RegistrationOperations, run_batch
     callbacks = RegistrationCallbacks(log=log_callback, cancelled=cancel_callback)
@@ -650,6 +813,7 @@ def run_registration_common(count, log_callback, cancel_callback, accounts_outpu
         persist_account_line=lambda email, password, sso: _append_account_line(accounts_output_file, email, password, sso),
         queue_unsaved_result=lambda payload, error: _queue_unsaved_account(accounts_output_file, payload, error, log_callback),
         add_tokens=lambda sso, email: add_token_to_grok2api_pools(sso, email=email, log_callback=log_callback),
+        add_chenyme_tokens=lambda sso, email: add_token_to_chenyme_grok2api(sso, email=email, log_callback=log_callback),
         export_cpa=lambda email, password, sso: maybe_export_cpa_xai_after_success(
             email=email, password=password, sso=sso,
             log_callback=log_callback, cancel_callback=cancel_callback,

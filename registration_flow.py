@@ -29,6 +29,7 @@ class RegistrationOperations:
     sleep: Callable[[float], None]
     cancelled_exception: type
     retry_exception: type
+    add_chenyme_tokens: Callable[[str, str], bool] = field(default=lambda sso, email: False)
 
 
 @dataclass
@@ -174,6 +175,11 @@ def persist_account_result(result, callbacks, ops):
     for name, state in pools.items():
         if isinstance(state, dict) and state.get("enabled") and not state.get("ok"):
             callbacks.log(f"[!] grok2api {name} 入池失败: {state.get('error')}")
+
+    try:
+        ops.add_chenyme_tokens(result.sso, result.email)
+    except Exception as exc:
+        callbacks.log(f"[!] chenyme 导入异常，账号结果已保留: {exc}")
 
     try:
         cpa = ops.export_cpa(result.email, result.password, result.sso)
