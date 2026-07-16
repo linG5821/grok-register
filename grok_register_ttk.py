@@ -1713,7 +1713,218 @@ def update_nsfw_settings(session, log_callback=None):
         return False, f"update_nsfw_settings 异常: {e}"
 
 
+def _extract_grok_cf_cookies(page):
+    cookies = page.cookies(all_domains=True, all_info=True) or []
+    parts = []
+    for item in cookies:
+        if isinstance(item, dict):
+            name = str(item.get("name", "")).strip()
+            value = str(item.get("value", "")).strip()
+            domain = str(item.get("domain", "")).strip().lower().lstrip(".")
+        else:
+            name = str(getattr(item, "name", "")).strip()
+            value = str(getattr(item, "value", "")).strip()
+            domain = str(getattr(item, "domain", "")).strip().lower().lstrip(".")
+        if not name or not value:
+            continue
+        if not (domain == "grok.com" or domain.endswith(".grok.com")):
+            continue
+        if name in {"cf_clearance", "__cf_bm"}:
+            parts.append(f"{name}={value}")
+    ua = str(page.run_js("return navigator.userAgent;") or "").strip()
+    return "; ".join(parts), ua
+
+
+def _inject_sso_to_page(page, sso_token):
+    token = str(sso_token or "").strip()
+    if not token:
+        return
+    for domain in (".x.ai", "accounts.x.ai", ".grok.com", "grok.com"):
+        for name in ("sso", "sso-rw"):
+            try:
+                page.set.cookies([
+                    {"name": name, "value": token, "domain": domain, "path": "/", "secure": True}
+                ])
+            except Exception:
+                pass
+
+
+def _auto_click_cf_turnstile(page):
+    try:
+        token = page.run_js(r"""
+var el = document.querySelector('input[name="cf-turnstile-response"]');
+if (el && el.value && el.value.length >= 80) return true;
+if (window.turnstile && typeof turnstile.getResponse === 'function') {
+    var r = turnstile.getResponse();
+    if (r && r.length >= 80) return true;
+}
+return false;
+        """)
+        if token:
+            return True
+    except Exception:
+        pass
+    try:
+        wrapper = page.ele("@name=cf-turnstile-response", timeout=0.5)
+    except Exception:
+        return False
+    if wrapper is None:
+        return False
+    try:
+        parent_el = wrapper.parent()
+        iframe = None
+        try:
+            iframe = parent_el.shadow_root.ele("tag:iframe", timeout=1)
+        except Exception:
+            pass
+        if iframe:
+            try:
+                iframe.run_js(r"""
+window.dtp=1;
+function getRandomInt(min,max){return Math.floor(Math.random()*(max-min+1))+min;}
+Object.defineProperty(MouseEvent.prototype,'screenX',{value:getRandomInt(800,1200)});
+Object.defineProperty(MouseEvent.prototype,'screenY',{value:getRandomInt(400,700)});
+                """)
+            except Exception:
+                pass
+            try:
+                body_sr = iframe.ele("tag:body", timeout=1).shadow_root
+                btn = body_sr.ele("tag:input", timeout=1)
+                if btn:
+                    btn.click()
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
+
+
 def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
+    global page
+
+    sso = _normalize_sso_token(token)
+    if not sso:
+        return False, "token 为空"
+
+    the_page = page
+    if the_page is None:
+        if log_callback:
+            log_callback("[Debug] 无浏览器页面，回退 HTTP 模式")
+        return _enable_nsfw_http(token, cf_clearance=cf_clearance, log_callback=log_callback)
+
+    try:
+        _inject_sso_to_page(the_page, sso)
+
+        try:
+            the_page.get("https://grok.com/")
+        except Exception:
+            the_page = refresh_active_page()
+            _inject_sso_to_page(the_page, sso)
+            the_page.get("https://grok.com/")
+
+        deadline = time.time() + 90
+        cf_ok = False
+        last_click = 0
+        while time.time() < deadline:
+            time.sleep(1)
+            try:
+                state = the_page.run_js(r"""
+var t = String(document.title||'').toLowerCase();
+var b = String(document.body?document.body.innerText||'':'').toLowerCase();
+var c = t.includes('just a moment') || b.includes('verifying you are human') || b.includes('security verification');
+return {challenge:!!c, url:location.href, title:document.title};
+                """) or {}
+            except Exception:
+                continue
+            if not state.get("challenge") and "grok.com" in str(state.get("url", "")).lower():
+                cf_ok = True
+                if log_callback:
+                    log_callback("[*] grok.com 已加载（Cloudflare 已通过）")
+                break
+            now = time.time()
+            if state.get("challenge") and now - last_click >= 5:
+                if _auto_click_cf_turnstile(the_page):
+                    if log_callback:
+                        log_callback("[*] 已自动点击 Turnstile，等待验证...")
+                last_click = now
+
+        if not cf_ok:
+            if log_callback:
+                log_callback("[!] grok.com Cloudflare 超时未通过，跳过 NSFW 激活")
+            return False, "grok.com CF 超时"
+
+        time.sleep(1.5)
+
+        cf_cookies, user_agent = _extract_grok_cf_cookies(the_page)
+        if not cf_cookies or "cf_clearance=" not in cf_cookies:
+            if log_callback:
+                log_callback("[!] 未获取到 cf_clearance cookie，尝试继续...")
+
+        proxies = get_proxies()
+        with requests.Session(impersonate="chrome120", proxies=proxies) as session:
+            if cf_cookies:
+                for part in cf_cookies.split(";"):
+                    n, sep, v = part.strip().partition("=")
+                    if n and v:
+                        session.cookies.set(n, v, domain=".grok.com")
+            for name in ("sso", "sso-rw"):
+                session.cookies.set(name, sso, domain=".x.ai")
+                session.cookies.set(name, sso, domain=".grok.com")
+            if user_agent:
+                session.headers.update({"user-agent": user_agent})
+
+            ok, message = set_tos_accepted(session, log_callback)
+            if not ok:
+                if log_callback:
+                    log_callback(f"[!] TOS 接受失败: {message}")
+                return False, message
+            if log_callback:
+                log_callback("[+] TOS 已接受")
+
+        birth = generate_random_birthdate()
+        birth_result = the_page.run_js(r"""
+var bd = String(arguments[0]||'');
+return fetch('/rest/auth/set-birth-date', {
+  method:'POST', credentials:'include',
+  headers:{'content-type':'application/json'},
+  body: JSON.stringify({birthDate:bd})
+}).then(function(r) {
+  return r.text().then(function(t) { return {status:r.status, body: String(t||'').slice(0,120)}; });
+}).catch(function(e) { return {status:0, body: String(e)}; });
+        """, birth, timeout=20)
+        birth_status = int((birth_result or {}).get("status", 0) or 0)
+        if 200 <= birth_status < 300:
+            if log_callback:
+                log_callback(f"[+] 生日已设置: {birth}")
+        else:
+            if log_callback:
+                log_callback(f"[Debug] 生日设置响应: status={birth_status} body={birth_result}")
+            # 400/409/422 means already set; tolerate
+            if birth_status not in (400, 409, 422):
+                return True, f"web 激活完成 (birth={birth_status})"
+
+        probe = the_page.run_js(r"""
+return fetch('/rest/app-chat/conversations?pageSize=1', {credentials:'include'})
+  .then(function(r) { return {status:r.status}; })
+  .catch(function() {
+    return fetch('/', {credentials:'include'}).then(function(r) { return {status:r.status}; });
+  });
+        """, timeout=20)
+        probe_status = int((probe or {}).get("status", 0) or 0)
+        if 200 <= probe_status < 400:
+            if log_callback:
+                log_callback("[+] NSFW Web 激活完成（TOS + 生日，grok.com 可访问）")
+            return True, "web 激活成功"
+        return True, f"web 激活完成 (probe={probe_status})"
+
+    except Exception as e:
+        if log_callback:
+            log_callback(f"[Debug] 浏览器 NSFW 异常: {e}")
+        return False, f"浏览器模式异常: {e}"
+
+
+def _enable_nsfw_http(token, cf_clearance="", log_callback=None):
     proxies = get_proxies()
     user_agent = get_user_agent()
     try:
@@ -1736,7 +1947,7 @@ def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
             ok, message = update_nsfw_settings(session, log_callback)
             if not ok:
                 return False, message
-            return True, "成功开启 NSFW"
+            return True, "成功开启 NSFW (HTTP)"
     except Exception as e:
         return False, f"异常: {str(e)}"
 
