@@ -21,3 +21,10 @@ config.local.json
 .vscode/
 DrissionPage/
 autoPortData/
+cpa_auths/
+xai-*.json
+cpa_auth_failed.txt
+screenshots/
+
+*.pending.jsonl
+*.pending.jsonl.lock
