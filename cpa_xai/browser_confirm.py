@@ -369,8 +369,7 @@ def approve_device_code(
                 continue
         if "/consent" in url or "授权 Grok Build" in text or "Authorize Grok Build" in text:
             phase = "consent"
-            if _cookie_banner_visible(_visible_text(page)):
-                _dismiss_cookie_banner(page, logger)
+            if _dismiss_cookie_banner(page, logger):
                 _sleep(0.6)
                 continue
             if _click_exact(page, ["允许", "Allow", "Authorize", "Approve"], logger, real=True):
