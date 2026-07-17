@@ -158,6 +158,20 @@ def configure_token_runtime(config_ref, http_get, http_post, log_exception,
     globals()["RemoteTokenRequestError"] = request_error
 
 
+def remote_import_http_get(url, **kwargs):
+    """远程入池 GET：默认直连，remote_import_use_proxy=true 时走注册代理。"""
+    use_proxy = bool(config.get("remote_import_use_proxy", False))
+    kwargs.setdefault("force_direct", not use_proxy)
+    return http_get(url, **kwargs)
+
+
+def remote_import_http_post(url, **kwargs):
+    """远程入池 POST：默认直连，remote_import_use_proxy=true 时走注册代理。"""
+    use_proxy = bool(config.get("remote_import_use_proxy", False))
+    kwargs.setdefault("force_direct", not use_proxy)
+    return http_post(url, **kwargs)
+
+
 def resolve_grok2api_local_token_file():
     configured = str(config.get("grok2api_local_token_file", "") or "").strip()
     if configured:
@@ -307,7 +321,7 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
     for api_base in api_bases:
         endpoint = f"{api_base}/tokens/add"
         try:
-            response = http_post(endpoint, headers=headers, params=query, json=add_payload, timeout=30)
+            response = remote_import_http_post(endpoint, headers=headers, params=query, json=add_payload, timeout=30)
         except Exception as exc:
             raise RemoteTokenRequestError(f"远端 /tokens/add 网络请求失败: {endpoint}: {exc}") from exc
         status = int(getattr(response, "status_code", 0) or 0)
@@ -331,7 +345,7 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
     for api_base in api_bases or [base]:
         endpoint = f"{api_base}/tokens"
         try:
-            response = http_get(endpoint, headers=headers, params=query, timeout=20)
+            response = remote_import_http_get(endpoint, headers=headers, params=query, timeout=20)
         except Exception as exc:
             raise RemoteTokenRequestError(f"旧版远端池读取网络失败: {endpoint}: {exc}") from exc
         status = int(getattr(response, "status_code", 0) or 0)
@@ -370,7 +384,7 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
     save_headers["If-Match"] = etag
     endpoint = f"{fallback_base}/tokens"
     try:
-        response = http_post(endpoint, headers=save_headers, params=query, json=current, timeout=30)
+        response = remote_import_http_post(endpoint, headers=save_headers, params=query, json=current, timeout=30)
     except Exception as exc:
         raise RemoteTokenRequestError(f"旧版远端池保存网络失败: {endpoint}: {exc}") from exc
     status = int(getattr(response, "status_code", 0) or 0)

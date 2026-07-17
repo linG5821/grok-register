@@ -195,36 +195,104 @@ def create_browser_options(browser_proxy="", extension_path=None):
     return options
 
 
+def remote_import_use_proxy():
+    """远程入池/chenyme 导入是否走注册代理；默认 False（直连）。"""
+    try:
+        return bool(_config.get("remote_import_use_proxy", False))
+    except Exception:
+        return False
+
+
+def mail_use_proxy():
+    """邮箱 API 是否走注册代理；默认 False（与历史行为一致）。"""
+    try:
+        return bool(_config.get("mail_use_proxy", False))
+    except Exception:
+        return False
+
+
 def _build_request_kwargs(**kwargs):
     request_kwargs = dict(kwargs)
+    force_direct = bool(request_kwargs.pop("force_direct", False))
     proxies = request_kwargs.pop("proxies", None)
-    if proxies is None:
-        proxies = get_proxies()
-    if proxies:
-        request_kwargs["proxies"] = proxies
+    if force_direct:
+        # 显式空代理，避免 curl_cffi 再读 HTTP_PROXY
+        request_kwargs["proxies"] = {}
+    else:
+        if proxies is None:
+            proxies = get_proxies()
+        if proxies:
+            request_kwargs["proxies"] = proxies
     request_kwargs.setdefault("timeout", 15)
-    return request_kwargs
+    return request_kwargs, force_direct
+
+
+def _with_optional_cleared_proxy_env(force_direct, func):
+    saved = {}
+    if force_direct:
+        try:
+            from proxy_manager import clear_proxy_environment, restore_proxy_environment
+            saved = clear_proxy_environment()
+        except Exception:
+            saved = {}
+    try:
+        return func()
+    finally:
+        if force_direct and saved:
+            try:
+                from proxy_manager import restore_proxy_environment
+                restore_proxy_environment(saved)
+            except Exception:
+                pass
 
 
 def http_get(url, **kwargs):
-    request_kwargs = _build_request_kwargs(**kwargs)
-    try:
-        return requests.get(url, **request_kwargs)
-    except Exception as exc:
-        if is_proxy_connection_error(exc):
-            direct = dict(request_kwargs)
-            direct.pop("proxies", None)
-            return requests.get(url, **direct)
-        raise
+    request_kwargs, force_direct = _build_request_kwargs(**kwargs)
+
+    def _do():
+        try:
+            return requests.get(url, **request_kwargs)
+        except Exception as exc:
+            if (not force_direct) and is_proxy_connection_error(exc):
+                direct = dict(request_kwargs)
+                direct.pop("proxies", None)
+                return requests.get(url, **direct)
+            raise
+
+    return _with_optional_cleared_proxy_env(force_direct, _do)
 
 
 def http_post(url, **kwargs):
-    request_kwargs = _build_request_kwargs(**kwargs)
-    try:
-        return requests.post(url, **request_kwargs)
-    except Exception as exc:
-        if is_proxy_connection_error(exc):
-            direct = dict(request_kwargs)
-            direct.pop("proxies", None)
-            return requests.post(url, **direct)
-        raise
+    request_kwargs, force_direct = _build_request_kwargs(**kwargs)
+
+    def _do():
+        try:
+            return requests.post(url, **request_kwargs)
+        except Exception as exc:
+            if (not force_direct) and is_proxy_connection_error(exc):
+                direct = dict(request_kwargs)
+                direct.pop("proxies", None)
+                return requests.post(url, **direct)
+            raise
+
+    return _with_optional_cleared_proxy_env(force_direct, _do)
+
+
+def remote_import_http_get(url, **kwargs):
+    kwargs.setdefault("force_direct", not remote_import_use_proxy())
+    return http_get(url, **kwargs)
+
+
+def remote_import_http_post(url, **kwargs):
+    kwargs.setdefault("force_direct", not remote_import_use_proxy())
+    return http_post(url, **kwargs)
+
+
+def mail_http_get(url, **kwargs):
+    kwargs.setdefault("force_direct", not mail_use_proxy())
+    return http_get(url, **kwargs)
+
+
+def mail_http_post(url, **kwargs):
+    kwargs.setdefault("force_direct", not mail_use_proxy())
+    return http_post(url, **kwargs)

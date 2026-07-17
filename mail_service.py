@@ -15,7 +15,7 @@ YYDS_API_BASE = "https://maliapi.215.im/v1"
 config = {}
 _cf_domain_index = 0
 _cloudmail_domain_index = 0
-_OWN_NAMES = {'cloudmail_get_email_and_token', 'get_messages', 'cloudflare_get_messages', 'get_yyds_api_key', 'yyds_generate_username', 'yyds_get_domains', 'yyds_get_email_and_token', 'yyds_get_oai_code', 'get_email_provider', 'cloudflare_get_domains', 'extract_verification_code', 'get_cloudflare_api_base', 'cloudflare_apply_auth_params', 'duckmail_get_oai_code', 'create_account', 'get_yyds_jwt', 'get_message_detail', 'yyds_create_account', 'get_duckmail_api_key', 'get_cloudflare_path', 'cloudflare_create_account', 'cloudflare_get_token', 'cloudflare_get_oai_code', 'get_cloudmail_public_token', 'generate_username', 'yyds_get_message_detail', 'cloudflare_next_default_domain', 'yyds_get_messages', 'yyds_get_token', 'get_domains', 'get_token', 'cloudflare_create_temp_address', 'get_cloudflare_api_key', 'get_cloudmail_path', 'get_cloudmail_api_base', 'cloudmail_get_oai_code', 'cloudflare_build_headers', 'cloudflare_is_admin_create_path', 'cloudmail_next_domain', 'cloudflare_get_message_detail', 'cloudmail_get_messages', 'get_user_agent', 'yyds_pick_domain', '_pick_list_payload', 'get_email_and_token', 'get_oai_code', 'get_cloudflare_auth_mode', 'pick_domain'}
+_OWN_NAMES = {'cloudmail_get_email_and_token', 'get_messages', 'cloudflare_get_messages', 'get_yyds_api_key', 'yyds_generate_username', 'yyds_get_domains', 'yyds_get_email_and_token', 'yyds_get_oai_code', 'get_email_provider', 'cloudflare_get_domains', 'extract_verification_code', 'get_cloudflare_api_base', 'cloudflare_apply_auth_params', 'duckmail_get_oai_code', 'create_account', 'get_yyds_jwt', 'get_message_detail', 'yyds_create_account', 'get_duckmail_api_key', 'get_cloudflare_path', 'cloudflare_create_account', 'cloudflare_get_token', 'cloudflare_get_oai_code', 'get_cloudmail_public_token', 'generate_username', 'yyds_get_message_detail', 'cloudflare_next_default_domain', 'yyds_get_messages', 'yyds_get_token', 'get_domains', 'get_token', 'cloudflare_create_temp_address', 'get_cloudflare_api_key', 'get_cloudmail_path', 'get_cloudmail_api_base', 'cloudmail_get_oai_code', 'cloudflare_build_headers', 'cloudflare_is_admin_create_path', 'cloudmail_next_domain', 'cloudflare_get_message_detail', 'cloudmail_get_messages', 'get_user_agent', 'yyds_pick_domain', '_pick_list_payload', 'get_email_and_token', 'get_oai_code', 'get_cloudflare_auth_mode', 'pick_domain', 'mail_http_get', 'mail_http_post', 'normalize_mail_body', 'bind_runtime'}
 
 
 def bind_runtime(namespace):
@@ -25,6 +25,20 @@ def bind_runtime(namespace):
         if name.startswith("__") or name in _OWN_NAMES or name in {"config", "_cf_domain_index", "_cloudmail_domain_index"}:
             continue
         globals()[name] = value
+
+
+def mail_http_get(url, **kwargs):
+    """邮箱 API GET：mail_use_proxy=false 时强制直连。"""
+    use_proxy = bool(config.get("mail_use_proxy", False))
+    kwargs.setdefault("force_direct", not use_proxy)
+    return http_get(url, **kwargs)
+
+
+def mail_http_post(url, **kwargs):
+    """邮箱 API POST：mail_use_proxy=false 时强制直连。"""
+    use_proxy = bool(config.get("mail_use_proxy", False))
+    kwargs.setdefault("force_direct", not use_proxy)
+    return http_post(url, **kwargs)
 
 
 def normalize_mail_body(*sources):
@@ -95,7 +109,7 @@ def cloudflare_create_account(api_base, address, password, api_key=None, expires
     payload = {"address": address, "password": password, "expiresIn": expires_in}
     path = get_cloudflare_path("cloudflare_path_accounts", "/accounts")
     params = cloudflare_apply_auth_params()
-    resp = http_post(f"{api_base}{path}", json=payload, headers=headers, params=params)
+    resp = mail_http_post(f"{api_base}{path}", json=payload, headers=headers, params=params)
     resp.raise_for_status()
     return resp.json()
 
@@ -115,7 +129,7 @@ def cloudflare_create_temp_address(api_base):
         if domain:
             payload["domain"] = domain
         headers = {"Content-Type": "application/json"}
-    resp = http_post(url, json=payload, headers=headers)
+    resp = mail_http_post(url, json=payload, headers=headers)
     resp.raise_for_status()
     try:
         data = resp.json()
@@ -135,7 +149,7 @@ def cloudflare_get_domains(api_base, api_key=None):
         headers["X-API-Key"] = api_key
     path = get_cloudflare_path("cloudflare_path_domains", "/domains")
     params = cloudflare_apply_auth_params()
-    resp = http_get(f"{api_base}{path}", headers=headers, params=params)
+    resp = mail_http_get(f"{api_base}{path}", headers=headers, params=params)
     resp.raise_for_status()
     return _pick_list_payload(resp.json())
 
@@ -148,7 +162,7 @@ def cloudflare_get_message_detail(api_base, token, message_id):
     last_err = None
     for url in candidates:
         try:
-            resp = http_get(
+            resp = mail_http_get(
                 url,
                 headers=headers,
                 params=cloudflare_apply_auth_params(),
@@ -168,7 +182,7 @@ def cloudflare_get_messages(api_base, token):
     path = get_cloudflare_path("cloudflare_path_messages", "/messages")
     params = {"limit": 20, "offset": 0}
     params = cloudflare_apply_auth_params(params)
-    resp = http_get(f"{api_base}{path}", headers=headers, params=params)
+    resp = mail_http_get(f"{api_base}{path}", headers=headers, params=params)
     resp.raise_for_status()
     try:
         data = resp.json()
@@ -266,7 +280,7 @@ def cloudflare_get_token(api_base, address, password, api_key=None):
     if api_key and "X-API-Key" in headers:
         headers["X-API-Key"] = api_key
     path = get_cloudflare_path("cloudflare_path_token", "/token")
-    resp = http_post(
+    resp = mail_http_post(
         f"{api_base}{path}",
         json={"address": address, "password": password},
         headers=headers,
@@ -323,7 +337,7 @@ def cloudmail_get_messages(address):
         "num": 1,
         "size": 20,
     }
-    resp = http_post(
+    resp = mail_http_post(
         f"{api_base}{get_cloudmail_path()}",
         headers={
             "Authorization": public_token,
@@ -436,7 +450,7 @@ def create_account(address, password, api_key=None, expires_in=0):
     if key:
         headers["Authorization"] = f"Bearer {key}"
     data = {"address": address, "password": password, "expiresIn": expires_in}
-    resp = http_post(f"{DUCKMAIL_API_BASE}/accounts", json=data, headers=headers)
+    resp = mail_http_post(f"{DUCKMAIL_API_BASE}/accounts", json=data, headers=headers)
     resp.raise_for_status()
     return resp.json()
 
@@ -544,7 +558,7 @@ def get_domains(api_key=None):
     key = api_key or get_duckmail_api_key()
     if key:
         headers["Authorization"] = f"Bearer {key}"
-    resp = http_get(f"{DUCKMAIL_API_BASE}/domains", headers=headers)
+    resp = mail_http_get(f"{DUCKMAIL_API_BASE}/domains", headers=headers)
     resp.raise_for_status()
     return resp.json().get("hydra:member", [])
 
@@ -601,13 +615,13 @@ def get_email_provider():
 
 def get_message_detail(token, message_id):
     headers = {"Authorization": f"Bearer {token}"}
-    resp = http_get(f"{DUCKMAIL_API_BASE}/messages/{message_id}", headers=headers)
+    resp = mail_http_get(f"{DUCKMAIL_API_BASE}/messages/{message_id}", headers=headers)
     resp.raise_for_status()
     return resp.json()
 
 def get_messages(token):
     headers = {"Authorization": f"Bearer {token}"}
-    resp = http_get(f"{DUCKMAIL_API_BASE}/messages", headers=headers)
+    resp = mail_http_get(f"{DUCKMAIL_API_BASE}/messages", headers=headers)
     resp.raise_for_status()
     return resp.json().get("hydra:member", [])
 
@@ -662,7 +676,7 @@ def get_oai_code(
 
 def get_token(address, password):
     data = {"address": address, "password": password}
-    resp = http_post(f"{DUCKMAIL_API_BASE}/token", json=data)
+    resp = mail_http_post(f"{DUCKMAIL_API_BASE}/token", json=data)
     resp.raise_for_status()
     return resp.json().get("token")
 
@@ -706,7 +720,7 @@ def yyds_create_account(address=None, domain=None, api_key=None, jwt=None):
         payload["domain"] = domain
     elif key or token:
         payload["autoDomainStrategy"] = "prefer_owned"
-    resp = http_post(f"{YYDS_API_BASE}/accounts", json=payload, headers=headers)
+    resp = mail_http_post(f"{YYDS_API_BASE}/accounts", json=payload, headers=headers)
     resp.raise_for_status()
     data = resp.json()
     if data.get("success"):
@@ -725,7 +739,7 @@ def yyds_get_domains(api_key=None, jwt=None):
         headers["Authorization"] = f"Bearer {token}"
     elif key:
         headers["X-API-Key"] = key
-    resp = http_get(f"{YYDS_API_BASE}/domains", headers=headers)
+    resp = mail_http_get(f"{YYDS_API_BASE}/domains", headers=headers)
     resp.raise_for_status()
     data = resp.json()
     return data.get("data", []) if data.get("success") else []
@@ -757,7 +771,7 @@ def yyds_get_message_detail(message_id, token=None, api_key=None, jwt=None):
         headers["Authorization"] = f"Bearer {temp_token}"
     elif key:
         headers["X-API-Key"] = key
-    resp = http_get(f"{YYDS_API_BASE}/messages/{message_id}", headers=headers)
+    resp = mail_http_get(f"{YYDS_API_BASE}/messages/{message_id}", headers=headers)
     resp.raise_for_status()
     data = resp.json()
     if data.get("success"):
@@ -772,7 +786,7 @@ def yyds_get_messages(address, token=None, api_key=None, jwt=None):
         headers["Authorization"] = f"Bearer {temp_token}"
     elif key:
         headers["X-API-Key"] = key
-    resp = http_get(
+    resp = mail_http_get(
         f"{YYDS_API_BASE}/messages",
         params={"address": address},
         headers=headers,
@@ -840,7 +854,7 @@ def yyds_get_token(address, api_key=None, jwt=None):
         headers["Authorization"] = f"Bearer {token}"
     elif key:
         headers["X-API-Key"] = key
-    resp = http_post(
+    resp = mail_http_post(
         f"{YYDS_API_BASE}/token", json={"address": address}, headers=headers
     )
     resp.raise_for_status()

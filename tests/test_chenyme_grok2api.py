@@ -50,7 +50,7 @@ class ChenymeGrok2ApiTests(unittest.TestCase):
 
     def test_disabled_skips_http(self):
         app.config["chenyme_grok2api_enabled"] = False
-        with patch.object(app, "http_post") as mock_post, \
+        with patch.object(app, "remote_import_http_post") as mock_post, \
                 patch.object(app.requests, "post") as mock_req:
             ok = app.add_token_to_chenyme_grok2api("sso=abc123", email="a@example.com")
         self.assertFalse(ok)
@@ -59,7 +59,7 @@ class ChenymeGrok2ApiTests(unittest.TestCase):
 
     def test_missing_config_skips(self):
         app.config["chenyme_grok2api_base"] = ""
-        with patch.object(app, "http_post") as mock_post, \
+        with patch.object(app, "remote_import_http_post") as mock_post, \
                 patch.object(app.requests, "post") as mock_req:
             ok = app.add_token_to_chenyme_grok2api("sso=abc123", email="a@example.com")
         self.assertFalse(ok)
@@ -80,7 +80,7 @@ class ChenymeGrok2ApiTests(unittest.TestCase):
                 }
             })
 
-        with patch.object(app, "http_post", side_effect=fake_post):
+        with patch.object(app, "remote_import_http_post", side_effect=fake_post):
             t1 = app.chenyme_get_access_token()
             t2 = app.chenyme_get_access_token()
 
@@ -119,7 +119,7 @@ class ChenymeGrok2ApiTests(unittest.TestCase):
         fake_mime = DummyCurlMime()
         with patch.object(app, "CurlMime", return_value=fake_mime), \
                 patch.object(app.requests, "post", side_effect=fake_req_post), \
-                patch.object(app, "http_post", side_effect=fake_http_post):
+                patch.object(app, "remote_import_http_post", side_effect=fake_http_post):
             ok = app.chenyme_import_sso("sso=rawtokenvalue")
 
         self.assertTrue(ok)
@@ -130,6 +130,8 @@ class ChenymeGrok2ApiTests(unittest.TestCase):
         self.assertEqual(kwargs["headers"]["Authorization"], "Bearer jwt-abc")
         self.assertEqual(kwargs["timeout"], 60)
         self.assertIn("multipart", kwargs)
+        # 默认 remote_import_use_proxy=false → multipart 直连
+        self.assertEqual(kwargs.get("proxies"), {})
         self.assertEqual(len(fake_mime.parts), 1)
         self.assertEqual(fake_mime.parts[0]["name"], "files")
         self.assertEqual(fake_mime.parts[0]["filename"], "grok-web-sso-tokens.txt")
@@ -163,7 +165,7 @@ class ChenymeGrok2ApiTests(unittest.TestCase):
         fake_mime = DummyCurlMime()
         with patch.object(app, "CurlMime", return_value=fake_mime), \
                 patch.object(app.requests, "post", side_effect=fake_req_post), \
-                patch.object(app, "http_post", side_effect=fake_req_post):
+                patch.object(app, "remote_import_http_post", side_effect=fake_req_post):
             ok = app.chenyme_import_sso("token-xyz")
 
         self.assertTrue(ok)
@@ -186,7 +188,7 @@ class ChenymeGrok2ApiTests(unittest.TestCase):
                 })
             return DummyResponse(text="done")
 
-        with patch.object(app, "http_post", side_effect=fake_post):
+        with patch.object(app, "remote_import_http_post", side_effect=fake_post):
             ok = app.chenyme_convert_to_build()
 
         self.assertTrue(ok)
@@ -220,13 +222,44 @@ class ChenymeGrok2ApiTests(unittest.TestCase):
         fake_mime = DummyCurlMime()
         with patch.object(app, "CurlMime", return_value=fake_mime), \
                 patch.object(app.requests, "post", side_effect=fake_req_post), \
-                patch.object(app, "http_post", side_effect=fake_http_post):
+                patch.object(app, "remote_import_http_post", side_effect=fake_http_post), \
+                patch.object(app, "chenyme_check_bot_flag", return_value=None):
             ok = app.add_token_to_chenyme_grok2api("sso=abc", email="a@example.com")
 
         self.assertTrue(ok)
         self.assertTrue(any(u.endswith("/auth/login") for u in post_calls))
         self.assertTrue(any(u.endswith("/accounts/web/import") for u in req_calls))
         self.assertTrue(any(u.endswith("/accounts/web/convert-to-build") for u in post_calls))
+
+    def test_import_multipart_uses_proxy_when_enabled(self):
+        app.config["remote_import_use_proxy"] = True
+        req_calls = []
+
+        def fake_req_post(url, **kwargs):
+            req_calls.append((url, kwargs))
+            return DummyResponse(text="ok")
+
+        def fake_login(url, **kwargs):
+            return DummyResponse({
+                "data": {
+                    "tokens": {
+                        "accessToken": "jwt-p",
+                        "accessTokenExpiresAt": "2099-01-01T00:00:00Z",
+                    }
+                }
+            })
+
+        fake_mime = DummyCurlMime()
+        with patch.object(app, "CurlMime", return_value=fake_mime), \
+                patch.object(app.requests, "post", side_effect=fake_req_post), \
+                patch.object(app, "remote_import_http_post", side_effect=fake_login):
+            ok = app.chenyme_import_sso("sso=tok")
+
+        self.assertTrue(ok)
+        import_calls = [c for c in req_calls if c[0].endswith("/accounts/web/import")]
+        self.assertEqual(len(import_calls), 1)
+        _, kwargs = import_calls[0]
+        self.assertNotIn("proxies", kwargs)
 
 
 if __name__ == "__main__":

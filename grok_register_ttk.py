@@ -278,7 +278,7 @@ def _bind_registration_browser():
 
 
 LocalAuthProxyBridge = _browser_runtime.LocalAuthProxyBridge
-for _name in ['get_configured_proxy', 'get_proxies', '_parse_proxy_url', '_safe_proxy_port', '_proxy_has_auth', '_strip_proxy_auth', '_proxy_endpoint_terms', 'is_proxy_connection_error', 'page_has_proxy_error', '_ReusableThreadingTCPServer', '_proxy_recv_until_headers', '_proxy_relay', '_LocalAuthProxyBridgeHandler', 'LocalAuthProxyBridge', 'prepare_browser_proxy', 'apply_browser_proxy_option', 'create_browser_options', '_build_request_kwargs', 'http_get', 'http_post']:
+for _name in ['get_configured_proxy', 'get_proxies', '_parse_proxy_url', '_safe_proxy_port', '_proxy_has_auth', '_strip_proxy_auth', '_proxy_endpoint_terms', 'is_proxy_connection_error', 'page_has_proxy_error', '_ReusableThreadingTCPServer', '_proxy_recv_until_headers', '_proxy_relay', '_LocalAuthProxyBridgeHandler', 'LocalAuthProxyBridge', 'prepare_browser_proxy', 'apply_browser_proxy_option', 'create_browser_options', '_build_request_kwargs', 'http_get', 'http_post', 'remote_import_http_get', 'remote_import_http_post', 'remote_import_use_proxy', 'mail_http_get', 'mail_http_post', 'mail_use_proxy']:
     if _name.startswith("_") and _name in {"_ReusableThreadingTCPServer", "_LocalAuthProxyBridgeHandler", "_proxy_recv_until_headers", "_proxy_relay"}:
         continue
     if _name != "LocalAuthProxyBridge":
@@ -655,7 +655,7 @@ def chenyme_login(log_callback=None):
     if not base or not username or not password:
         raise RuntimeError("chenyme grok2api 未配置 base/username/password")
     endpoint = f"{base}/api/admin/v1/auth/login"
-    resp = http_post(
+    resp = remote_import_http_post(
         endpoint,
         headers={"Content-Type": "application/json"},
         json={"username": username, "password": password},
@@ -725,12 +725,29 @@ def chenyme_import_sso(raw_token, log_callback=None):
             data=token.encode("utf-8"),
         )
         try:
-            resp = requests.post(
-                endpoint,
-                headers={"Authorization": f"Bearer {access_token}"},
-                multipart=mp,
-                timeout=60,
-            )
+            post_kwargs = {
+                "headers": {"Authorization": f"Bearer {access_token}"},
+                "multipart": mp,
+                "timeout": 60,
+            }
+            if not remote_import_use_proxy():
+                post_kwargs["proxies"] = {}
+                saved_env = {}
+                try:
+                    from proxy_manager import clear_proxy_environment, restore_proxy_environment
+                    saved_env = clear_proxy_environment()
+                except Exception:
+                    saved_env = {}
+                try:
+                    resp = requests.post(endpoint, **post_kwargs)
+                finally:
+                    try:
+                        from proxy_manager import restore_proxy_environment
+                        restore_proxy_environment(saved_env)
+                    except Exception:
+                        pass
+            else:
+                resp = requests.post(endpoint, **post_kwargs)
         finally:
             mp.close()
         if resp.status_code == 401 and attempt == 0:
@@ -756,7 +773,7 @@ def chenyme_convert_to_build(log_callback=None):
             log_callback=log_callback,
             force_refresh=(attempt > 0),
         )
-        resp = http_post(
+        resp = remote_import_http_post(
             endpoint,
             headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
             json=body,
@@ -829,7 +846,7 @@ def chenyme_check_bot_flag(email="", log_callback=None):
     try:
         access_token = chenyme_get_access_token(log_callback=log_callback)
         endpoint = f"{base}/api/admin/v1/accounts/export"
-        resp = http_get(
+        resp = remote_import_http_get(
             endpoint,
             headers={"Authorization": f"Bearer {access_token}"},
             timeout=30,
@@ -837,7 +854,7 @@ def chenyme_check_bot_flag(email="", log_callback=None):
         if resp.status_code == 401:
             chenyme_clear_token_cache()
             access_token = chenyme_get_access_token(log_callback=log_callback, force_refresh=True)
-            resp = http_get(
+            resp = remote_import_http_get(
                 endpoint,
                 headers={"Authorization": f"Bearer {access_token}"},
                 timeout=30,
@@ -1058,72 +1075,90 @@ class GrokRegisterGUI:
         self.cloudmail_public_token_entry = tk_entry(config_frame, textvariable=self.cloudmail_public_token_var, width=72)
         add_field(self.cloudmail_public_token_entry, 6, 1, columnspan=3)
 
-        add_label(7, 0, "grok2api 本地入池:")
+        add_label(7, 0, "邮箱走代理:")
+        self.mail_use_proxy_var = tk.BooleanVar(value=bool(config.get("mail_use_proxy", False)))
+        self.mail_use_proxy_check = tk_checkbutton(
+            config_frame,
+            text="邮箱 API 使用注册代理（默认关=直连）",
+            variable=self.mail_use_proxy_var,
+        )
+        add_field(self.mail_use_proxy_check, 7, 1, sticky=tk.W)
+
+        add_label(8, 0, "grok2api 本地入池:")
         self.grok2api_local_auto_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_add_local", True)))
         self.grok2api_local_auto_check = tk_checkbutton(config_frame, variable=self.grok2api_local_auto_var)
-        add_field(self.grok2api_local_auto_check, 7, 1, sticky=tk.W)
+        add_field(self.grok2api_local_auto_check, 8, 1, sticky=tk.W)
 
-        add_label(7, 2, "grok2api 池名:")
+        add_label(8, 2, "grok2api 池名:")
         self.grok2api_pool_name_var = tk.StringVar(value=str(config.get("grok2api_pool_name", "ssoBasic")))
         self.grok2api_pool_name_combo = tk_option_menu(
             config_frame, self.grok2api_pool_name_var, ["ssoBasic", "ssoSuper"], width=12
         )
-        add_field(self.grok2api_pool_name_combo, 7, 3, sticky=tk.W)
+        add_field(self.grok2api_pool_name_combo, 8, 3, sticky=tk.W)
 
-        add_label(8, 0, "本地 token.json:")
+        add_label(9, 0, "本地 token.json:")
         self.grok2api_local_file_var = tk.StringVar(value=str(config.get("grok2api_local_token_file", "")))
         self.grok2api_local_file_entry = tk_entry(config_frame, textvariable=self.grok2api_local_file_var, width=72)
-        add_field(self.grok2api_local_file_entry, 8, 1, columnspan=3)
+        add_field(self.grok2api_local_file_entry, 9, 1, columnspan=3)
 
-        add_label(9, 0, "grok2api 远端入池:")
+        add_label(10, 0, "grok2api 远端入池:")
         self.grok2api_remote_auto_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_add_remote", False)))
         self.grok2api_remote_auto_check = tk_checkbutton(config_frame, variable=self.grok2api_remote_auto_var)
-        add_field(self.grok2api_remote_auto_check, 9, 1, sticky=tk.W)
+        add_field(self.grok2api_remote_auto_check, 10, 1, sticky=tk.W)
 
-        add_label(10, 0, "grok2api 远端 Base:")
+        add_label(11, 0, "grok2api 远端 Base:")
         self.grok2api_remote_base_var = tk.StringVar(value=str(config.get("grok2api_remote_base", "")))
         self.grok2api_remote_base_entry = tk_entry(config_frame, textvariable=self.grok2api_remote_base_var, width=72)
-        add_field(self.grok2api_remote_base_entry, 10, 1, columnspan=3)
+        add_field(self.grok2api_remote_base_entry, 11, 1, columnspan=3)
 
-        add_label(11, 0, "grok2api 远端 app_key:")
+        add_label(12, 0, "grok2api 远端 app_key:")
         self.grok2api_remote_key_var = tk.StringVar(value=str(config.get("grok2api_remote_app_key", "")))
         self.grok2api_remote_key_entry = tk_entry(config_frame, textvariable=self.grok2api_remote_key_var, width=72)
-        add_field(self.grok2api_remote_key_entry, 11, 1, columnspan=3)
+        add_field(self.grok2api_remote_key_entry, 12, 1, columnspan=3)
 
-        add_label(12, 0, "OIDC / CPA:")
+        add_label(13, 0, "OIDC / CPA:")
         self.cpa_export_var = tk.BooleanVar(value=bool(config.get("cpa_export_enabled", False)))
         self.cpa_export_check = tk_checkbutton(config_frame, text="注册成功后导出 CPA xAI OIDC", variable=self.cpa_export_var)
-        add_field(self.cpa_export_check, 12, 1, sticky=tk.W)
+        add_field(self.cpa_export_check, 13, 1, sticky=tk.W)
 
-        add_label(12, 2, "CPA 输出目录:")
+        add_label(13, 2, "CPA 输出目录:")
         self.cpa_auth_dir_var = tk.StringVar(value=str(config.get("cpa_auth_dir", "./cpa_auths")))
         self.cpa_auth_dir_entry = tk_entry(config_frame, textvariable=self.cpa_auth_dir_var, width=34)
-        add_field(self.cpa_auth_dir_entry, 12, 3)
+        add_field(self.cpa_auth_dir_entry, 13, 3)
 
-        add_label(13, 0, "chenyme 自动导入:")
+        add_label(14, 0, "chenyme 自动导入:")
         self.chenyme_enabled_var = tk.BooleanVar(value=bool(config.get("chenyme_grok2api_enabled", False)))
         self.chenyme_enabled_check = tk_checkbutton(config_frame, variable=self.chenyme_enabled_var)
-        add_field(self.chenyme_enabled_check, 13, 1, sticky=tk.W)
+        add_field(self.chenyme_enabled_check, 14, 1, sticky=tk.W)
 
-        add_label(13, 2, "导入后 convert:")
+        add_label(14, 2, "导入后 convert:")
         self.chenyme_convert_var = tk.BooleanVar(value=bool(config.get("chenyme_grok2api_convert", True)))
         self.chenyme_convert_check = tk_checkbutton(config_frame, variable=self.chenyme_convert_var)
-        add_field(self.chenyme_convert_check, 13, 3, sticky=tk.W)
+        add_field(self.chenyme_convert_check, 14, 3, sticky=tk.W)
 
-        add_label(14, 0, "chenyme Base:")
+        add_label(15, 0, "远程导入走代理:")
+        self.remote_import_proxy_var = tk.BooleanVar(value=bool(config.get("remote_import_use_proxy", False)))
+        self.remote_import_proxy_check = tk_checkbutton(
+            config_frame,
+            text="chenyme/远端入池也使用注册代理（默认关=直连）",
+            variable=self.remote_import_proxy_var,
+        )
+        add_field(self.remote_import_proxy_check, 15, 1, columnspan=3, sticky=tk.W)
+
+        add_label(16, 0, "chenyme Base:")
         self.chenyme_base_var = tk.StringVar(value=str(config.get("chenyme_grok2api_base", "")))
         self.chenyme_base_entry = tk_entry(config_frame, textvariable=self.chenyme_base_var, width=72)
-        add_field(self.chenyme_base_entry, 14, 1, columnspan=3)
+        add_field(self.chenyme_base_entry, 16, 1, columnspan=3)
 
-        add_label(15, 0, "chenyme 用户名:")
+        add_label(17, 0, "chenyme 用户名:")
         self.chenyme_username_var = tk.StringVar(value=str(config.get("chenyme_grok2api_username", "")))
         self.chenyme_username_entry = tk_entry(config_frame, textvariable=self.chenyme_username_var, width=34)
-        add_field(self.chenyme_username_entry, 15, 1)
+        add_field(self.chenyme_username_entry, 17, 1)
 
-        add_label(15, 2, "chenyme 密码:")
+        add_label(17, 2, "chenyme 密码:")
         self.chenyme_password_var = tk.StringVar(value=str(config.get("chenyme_grok2api_password", "")))
         self.chenyme_password_entry = tk_entry(config_frame, textvariable=self.chenyme_password_var, width=34, show="*")
-        add_field(self.chenyme_password_entry, 15, 3)
+        add_field(self.chenyme_password_entry, 17, 3)
 
         btn_frame = tk.Frame(main_frame, bg=UI_BG)
         btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
@@ -1262,6 +1297,7 @@ class GrokRegisterGUI:
         config["email_provider"] = self.email_provider_var.get().strip() or "duckmail"
         config["enable_nsfw"] = bool(self.nsfw_var.get())
         config["proxy"] = self.proxy_var.get().strip()
+        config["mail_use_proxy"] = bool(self.mail_use_proxy_var.get())
         config["duckmail_api_key"] = self.api_key_var.get().strip()
         config["cloudflare_api_base"] = self.cloudflare_api_base_var.get().strip()
         config["cloudflare_api_key"] = self.cloudflare_api_key_var.get().strip()
@@ -1277,6 +1313,7 @@ class GrokRegisterGUI:
         config["grok2api_remote_app_key"] = self.grok2api_remote_key_var.get().strip()
         config["chenyme_grok2api_enabled"] = bool(self.chenyme_enabled_var.get())
         config["chenyme_grok2api_convert"] = bool(self.chenyme_convert_var.get())
+        config["remote_import_use_proxy"] = bool(self.remote_import_proxy_var.get())
         config["chenyme_grok2api_base"] = self.chenyme_base_var.get().strip()
         config["chenyme_grok2api_username"] = self.chenyme_username_var.get().strip()
         config["chenyme_grok2api_password"] = self.chenyme_password_var.get().strip()

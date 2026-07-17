@@ -23,6 +23,8 @@ DEFAULT_CONFIG = {
     "proxy_pool": [],
     "proxy_pool_strategy": "round_robin",
     "proxy_ipcheck": True,
+    "remote_import_use_proxy": False,
+    "mail_use_proxy": False,
     "enable_nsfw": True,
     "register_count": 1,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -101,7 +103,8 @@ def validate_config_structure(raw):
         "enable_nsfw", "grok2api_auto_add_local", "grok2api_auto_add_remote",
         "grok2api_allow_legacy_full_save", "cpa_export_enabled",
         "cpa_copy_to_hotload", "cpa_headless", "cpa_force_standalone",
-        "cpa_mint_cookie_inject", "proxy_ipcheck",
+        "cpa_mint_cookie_inject", "proxy_ipcheck", "remote_import_use_proxy",
+        "mail_use_proxy",
     )
     for key in bool_keys:
         cfg[key] = _require_bool(cfg, key)

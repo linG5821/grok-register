@@ -76,6 +76,8 @@ class Grok2ApiRemotePoolTests(unittest.TestCase):
             "pool": "basic",
             "tags": ["auto-register"],
         })
+        # 默认 remote_import_use_proxy=false → force_direct
+        self.assertTrue(calls[-1][1].get("force_direct"))
 
     def test_remote_pool_does_not_duplicate_admin_api_prefix_when_base_already_points_to_admin_api(self):
         self._configure(
@@ -167,6 +169,20 @@ class Grok2ApiRemotePoolTests(unittest.TestCase):
                 patch.object(app, "http_get", side_effect=fake_get):
             with self.assertRaises(app.RemoteTokenCompatibilityError):
                 app.add_token_to_grok2api_remote_pool("abc")
+
+    def test_remote_pool_uses_proxy_when_switch_enabled(self):
+        self._configure(remote_import_use_proxy=True)
+        calls = []
+
+        def fake_post(url, **kwargs):
+            calls.append((url, kwargs))
+            return DummyResponse({"status": "success", "count": 1})
+
+        with patch.object(app, "http_post", side_effect=fake_post):
+            ok = app.add_token_to_grok2api_remote_pool("sso=abc", email="a@example.com")
+
+        self.assertTrue(ok)
+        self.assertFalse(calls[0][1].get("force_direct", False))
 
 
 if __name__ == "__main__":

@@ -46,6 +46,8 @@ class CloudflareAdminCreateTests(unittest.TestCase):
         self.assertEqual(captured["url"], "https://temp-mail.example.com/api/new_address")
         self.assertEqual(captured["json"], {})
         self.assertEqual(captured["headers"], {"Content-Type": "application/json"})
+        # 默认 mail_use_proxy=false → 强制直连
+        self.assertTrue(captured.get("force_direct"))
 
     def test_app_uses_admin_new_address_with_x_admin_auth(self):
         app.config.update({
@@ -98,6 +100,25 @@ class CloudflareAdminCreateTests(unittest.TestCase):
         self.assertEqual(captured["url"], "https://temp-mail.ikun.day/api/new_address")
         self.assertEqual(captured["json"], {"domain": "vitassk.com"})
         self.assertEqual(captured["headers"], {"Content-Type": "application/json"})
+
+    def test_mail_api_direct_when_mail_use_proxy_disabled(self):
+        app.config.update({
+            "mail_use_proxy": False,
+            "cloudflare_api_key": "",
+            "cloudflare_auth_mode": "none",
+            "cloudflare_path_accounts": "/api/new_address",
+            "defaultDomains": "vitassk.com",
+        })
+        captured = {}
+
+        def fake_post(url, **kwargs):
+            captured.update(kwargs)
+            return DummyResponse({"address": "anon@vitassk.com", "jwt": "anon-jwt"})
+
+        with patch.object(app, "http_post", side_effect=fake_post):
+            app.cloudflare_create_temp_address("https://temp-mail.ikun.day")
+
+        self.assertTrue(captured.get("force_direct"))
 
     def test_debug_tool_can_create_address_through_admin_api(self):
         captured = {}
