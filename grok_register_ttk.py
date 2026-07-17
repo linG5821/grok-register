@@ -789,6 +789,7 @@ def add_token_to_chenyme_grok2api(raw_token, email="", log_callback=None):
             return False
         if config.get("chenyme_grok2api_convert", True):
             chenyme_convert_to_build(log_callback=log_callback)
+        chenyme_check_bot_flag(email=email, log_callback=log_callback)
         return True
     except Exception as exc:
         if log_callback:
@@ -796,12 +797,91 @@ def add_token_to_chenyme_grok2api(raw_token, email="", log_callback=None):
         return False
 
 
-def run_registration_common(count, log_callback, cancel_callback, accounts_output_file, observer):
+def _decode_jwt_payload(token):
+    import base64
+    import json as _json
+
+    text = str(token or "").strip()
+    if not text or text.count(".") < 2:
+        return {}
+    try:
+        segment = text.split(".")[1]
+        segment += "=" * (-len(segment) % 4)
+        raw = base64.urlsafe_b64decode(segment)
+        return _json.loads(raw.decode("utf-8", "ignore"))
+    except Exception:
+        return {}
+
+
+def chenyme_check_bot_flag(email="", log_callback=None):
+    """转换完成后拉一次账号导出，解 JWT 检查 bot_flag_source。
+
+    该字段是 xAI 反滥用系统的账号级标记；一旦出现，所有 /v1/* 端点会
+    直接返回 403 Access denied。这里只做日志告警，不阻塞流程——
+    真正的删除脏号交给 scripts/purge_bot_accounts.py 由人工触发。
+    """
+    email = str(email or "").strip().lower()
+    if not email:
+        return None
+    base = _chenyme_normalize_base(config.get("chenyme_grok2api_base", ""))
+    if not base:
+        return None
+    try:
+        access_token = chenyme_get_access_token(log_callback=log_callback)
+        endpoint = f"{base}/api/admin/v1/accounts/export"
+        resp = http_get(
+            endpoint,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=30,
+        )
+        if resp.status_code == 401:
+            chenyme_clear_token_cache()
+            access_token = chenyme_get_access_token(log_callback=log_callback, force_refresh=True)
+            resp = http_get(
+                endpoint,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=30,
+            )
+        resp.raise_for_status()
+        payload = resp.json() if hasattr(resp, "json") else {}
+        accounts = []
+        if isinstance(payload, dict):
+            accounts = payload.get("accounts") or []
+        target = None
+        for account in accounts:
+            if not isinstance(account, dict):
+                continue
+            if account.get("provider") != "grok_build":
+                continue
+            if str(account.get("name", "") or "").strip().lower() == email:
+                target = account
+                break
+        if not target:
+            if log_callback:
+                log_callback(f"[Debug] 未在 chenyme 中找到 Build 账号 {email}，跳过 bot_flag 检查")
+            return None
+        claims = _decode_jwt_payload(target.get("access_token"))
+        flag = claims.get("bot_flag_source")
+        if flag is not None and log_callback:
+            log_callback(f"[!] 账号 {email} 被 xAI 打上 bot_flag_source={flag}，Build 相关端点将 403（billing/chat/responses 均不可用），建议弃用")
+        elif log_callback:
+            log_callback(f"[+] 账号 {email} 通过 bot_flag 检查，token 干净")
+        return flag
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] bot_flag 检查异常，已忽略: {exc}")
+        return None
+
+
+def run_registration_common(count, log_callback, cancel_callback, accounts_output_file, observer,
+                            start_browser_fn=None, restart_browser_fn=None):
     from registration_flow import RegistrationCallbacks, RegistrationOperations, run_batch
     callbacks = RegistrationCallbacks(log=log_callback, cancelled=cancel_callback)
+    _start = start_browser_fn or (lambda: start_browser(log_callback=log_callback))
+    _restart = restart_browser_fn or (lambda: restart_browser(log_callback=log_callback))
     operations = RegistrationOperations(
-        start_browser=lambda: start_browser(log_callback=log_callback),
-        restart_browser=lambda: restart_browser(log_callback=log_callback),
+        start_browser=_start,
+        restart_browser=_restart,
         browser_missing=lambda: _registration_browser.browser is None,
         open_signup_page=lambda: open_signup_page(log_callback=log_callback, cancel_callback=cancel_callback),
         fill_email_and_submit=lambda: fill_email_and_submit(log_callback=log_callback, cancel_callback=cancel_callback),
@@ -1114,6 +1194,9 @@ class GrokRegisterGUI:
                     self.status_label.config(foreground="blue" if running else "green")
                 elif kind == "error":
                     messagebox.showerror(event[1], event[2])
+                elif kind == "call":
+                    # 在 Tk 主线程执行（Chromium CDP 在 Windows 后台线程会失败）
+                    event[1]()
         except queue.Empty:
             pass
         except Exception as exc:
@@ -1123,6 +1206,27 @@ class GrokRegisterGUI:
                 self.root.after(50, self.process_ui_queue)
             except Exception:
                 pass
+
+    def call_on_ui_thread(self, func, timeout=180):
+        """把 func 调度到 Tk 主线程并等待结果。已在主线程则直接调用。"""
+        if threading.current_thread() is threading.main_thread():
+            return func()
+        done = queue.Queue(maxsize=1)
+
+        def runner():
+            try:
+                done.put(("ok", func()))
+            except Exception as exc:
+                done.put(("err", exc))
+
+        self.ui_queue.put(("call", runner))
+        try:
+            kind, payload = done.get(timeout=timeout)
+        except queue.Empty:
+            raise TimeoutError(f"主线程调用超时（{timeout}s）")
+        if kind == "err":
+            raise payload
+        return payload
 
     def log(self, message):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
@@ -1231,6 +1335,13 @@ class GrokRegisterGUI:
                 cancel_callback=self.should_stop,
                 accounts_output_file=self.accounts_output_file,
                 observer=observer,
+                # Windows：Chromium 必须在 Tk 主线程启动，后台线程 + 代理会 CDP 失败
+                start_browser_fn=lambda: self.call_on_ui_thread(
+                    lambda: start_browser(log_callback=self.log), timeout=180
+                ),
+                restart_browser_fn=lambda: self.call_on_ui_thread(
+                    lambda: restart_browser(log_callback=self.log), timeout=180
+                ),
             )
             self.success_count = batch.success_count
             self.fail_count = batch.fail_count

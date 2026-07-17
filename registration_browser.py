@@ -1,5 +1,6 @@
 """管理主注册浏览器生命周期并实现注册页面自动化操作。"""
 import gc
+import os
 import random
 import re
 import secrets
@@ -421,9 +422,49 @@ def start_browser(log_callback=None, use_proxy=True):
         bridge = None
         try:
             browser_proxy, bridge = prepare_browser_proxy(use_proxy=use_proxy, log_callback=log_callback)
-            browser = Chromium(create_browser_options(browser_proxy=browser_proxy))
+            if log_callback:
+                if browser_proxy:
+                    log_callback(f"[*] 正在启动 Chromium（代理 {browser_proxy}，第 {attempt}/4 次）…")
+                else:
+                    log_callback(f"[*] 正在启动 Chromium（直连，第 {attempt}/4 次）…")
+            options = create_browser_options(browser_proxy=browser_proxy)
+            if log_callback:
+                try:
+                    args = list(getattr(options, "arguments", []) or [])
+                    log_callback(
+                        f"[Debug] proxy_args={[a for a in args if 'proxy' in str(a).lower()]}"
+                    )
+                    # 若环境变量仍带代理，Chrome 会继承并搞挂 CDP（脚本不过 env 所以能过）
+                    env_proxy = {
+                        k: os.environ.get(k)
+                        for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+                        if os.environ.get(k)
+                    }
+                    if env_proxy:
+                        log_callback(f"[Debug] 启动前将临时清除代理环境变量: {list(env_proxy.keys())}")
+                except Exception:
+                    pass
+            # rotate_session 会把 HTTP_PROXY 写进 os.environ；Chrome/Popen 会继承，
+            # Windows 上会导致 CDP「Connection to remote host was lost」。
+            # 测试脚本不写 env，所以同 PAC 参数能 1.4s 成功。
+            saved_env = {}
+            try:
+                from proxy_manager import clear_proxy_environment, restore_proxy_environment
+                saved_env = clear_proxy_environment()
+            except Exception:
+                saved_env = {}
+            try:
+                browser = Chromium(options)
+            finally:
+                try:
+                    from proxy_manager import restore_proxy_environment
+                    restore_proxy_environment(saved_env)
+                except Exception:
+                    pass
             browser_proxy_bridge = bridge
             browser_started_with_proxy = bool(browser_proxy)
+            if log_callback:
+                log_callback("[*] Chromium 已连接，正在获取标签页…")
             tabs = browser.get_tabs()
             page = tabs[-1] if tabs else browser.new_tab()
             if log_callback and getattr(browser, "user_data_path", None):
@@ -523,10 +564,10 @@ function nodeText(node) {
         node.getAttribute('aria-label'),
         node.getAttribute('title'),
         node.getAttribute('href'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+    ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
 }
 function scoreEntry(node) {
-    const compact = nodeText(node).replace(/\s+/g, '');
+    const compact = nodeText(node).replace(/\\s+/g, '');
     const lower = compact.toLowerCase();
     if (compact.includes('使用邮箱注册')) return 100;
     if (lower.includes('signupwithemail')) return 95;
@@ -660,7 +701,7 @@ function textOf(node) {
         node.getAttribute('name'),
         node.getAttribute('id'),
         node.getAttribute('autocomplete'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+    ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
 }
 function describeInput(node) {
     return [
@@ -670,7 +711,7 @@ function describeInput(node) {
         `placeholder=${node.getAttribute('placeholder') || ''}`,
         `aria=${node.getAttribute('aria-label') || ''}`,
         `testid=${node.getAttribute('data-testid') || ''}`,
-    ].join(' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+    ].join(' ').replace(/\\s+/g, ' ').trim().slice(0, 160);
 }
 function describeAction(node) {
     return textOf(node).slice(0, 120);
@@ -757,10 +798,10 @@ function nodeText(node) {
         node.getAttribute('aria-label'),
         node.getAttribute('title'),
         node.getAttribute('href'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+    ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
 }
 function scoreEntry(node) {
-    const compact = nodeText(node).replace(/\s+/g, '');
+    const compact = nodeText(node).replace(/\\s+/g, '');
     const lower = compact.toLowerCase();
     if (compact.includes('使用邮箱注册')) return 100;
     if (lower.includes('signupwithemail')) return 95;
@@ -816,7 +857,7 @@ function textOf(node) {
         node.getAttribute('name'),
         node.getAttribute('id'),
         node.getAttribute('autocomplete'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+    ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
 }
 function emailCandidates() {
     const direct = Array.from(document.querySelectorAll('input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"], input[placeholder*="mail" i], input[aria-label*="mail" i]'));
@@ -838,7 +879,7 @@ if (inputType === 'email' && !input.checkValidity()) return false;
 const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]'))
     .filter((node) => isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true');
 const submitButton = buttons.find((node) => {
-    const text = textOf(node).replace(/\s+/g, '');
+    const text = textOf(node).replace(/\\s+/g, '');
     const lower = text.toLowerCase();
     return (
         text === '注册' ||
@@ -891,7 +932,7 @@ def fill_code_and_submit(email, dev_token, timeout=180, log_callback=None, cance
             r"""
 const nodes = Array.from(document.querySelectorAll('button, a, [role="button"]'));
 const target = nodes.find((node) => {
-  const t = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
+  const t = (node.innerText || node.textContent || '').replace(/\\s+/g, '').toLowerCase();
   return t.includes('重新发送') || t.includes('resend') || t.includes('再次发送');
 });
 if (target && !target.disabled) { target.click(); return true; }
@@ -1294,13 +1335,13 @@ function buttonText(node) {
         node.getAttribute('value'),
         node.getAttribute('aria-label'),
         node.getAttribute('title'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+    ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
 }
 const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]')).filter((node) => {
     return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
 });
 const submitBtn = buttons.find((node) => {
-    const t = buttonText(node).replace(/\s+/g, '').toLowerCase();
+    const t = buttonText(node).replace(/\\s+/g, '').toLowerCase();
     return t.includes('完成注册') || t.includes('创建账户') || t.includes('signup') || t.includes('createaccount');
 });
 if (!submitBtn) {
@@ -1395,7 +1436,7 @@ function isVisible(node) {
     return rect.width > 0 && rect.height > 0;
 }
 const titleHit = !!Array.from(document.querySelectorAll('h1,h2,div,span')).find((el) => {
-    const t = (el.textContent || '').replace(/\s+/g, '');
+    const t = (el.textContent || '').replace(/\\s+/g, '');
     const lower = t.toLowerCase();
     return t.includes('完成注册') || lower.includes('completeyoursignup') || lower.includes('completesignup');
 });
@@ -1417,13 +1458,13 @@ function buttonText(node) {
         node.getAttribute('value'),
         node.getAttribute('aria-label'),
         node.getAttribute('title'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+    ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
 }
 const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]')).filter((node) => {
     return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
 });
 const submitBtn = buttons.find((node) => {
-    const t = buttonText(node).replace(/\s+/g, '').toLowerCase();
+    const t = buttonText(node).replace(/\\s+/g, '').toLowerCase();
     return t.includes('完成注册') || t.includes('创建账户') || t.includes('signup') || t.includes('createaccount');
 });
 if (!submitBtn) {

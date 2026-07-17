@@ -32,8 +32,24 @@ def resolve_proxy(explicit=None):
         str(os.environ.get("HTTP_PROXY") or "").strip(),
     ):
         if candidate:
-            return candidate
+            return _expand_placeholders(candidate)
     return ""
+
+
+def _expand_placeholders(raw):
+    """代理 URL 若含 {rand}/{session} 占位符，交给 proxy_manager 展开。
+
+    循环导入安全：只在含占位符时才 import。"""
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    if not any(token in value for token in ("{rand}", "{RAND}", "{session}", "{SESSION}")):
+        return value
+    try:
+        from proxy_manager import expand_proxy  # 延迟导入避免循环
+        return expand_proxy(value)
+    except Exception:
+        return value
 
 
 def _parse_proxy(proxy):
@@ -205,15 +221,36 @@ def proxy_for_chromium(proxy):
     return "%s://%s:%s" % (scheme, host, port)
 
 
+def _is_loopback_host(host):
+    h = str(host or "").strip().lower().strip("[]")
+    return h in ("127.0.0.1", "localhost", "::1")
+
+
 def prepare_chromium_proxy(proxy, log=None):
+    """为 Chromium 准备代理。
+
+    - 带认证的 http/https：起本地桥注入 Proxy-Authorization
+    - 远程 http/https（非 127.0.0.1）：也起本地桥，Chrome 只连本机，
+      避免 --proxy-server 指向局域网 IP 时 CDP 连接异常/假死
+    - socks / 本机无认证代理：原样返回
+    """
     logger = log or (lambda message: None)
     raw = str(proxy or "").strip()
     if not raw:
         return "", None
-    if _has_proxy_auth(raw):
+    parsed = _parse_proxy(raw)
+    scheme = (parsed.scheme or "http").lower() if parsed else "http"
+    host = parsed.hostname if parsed else ""
+    need_bridge = False
+    if scheme in ("http", "https"):
+        if _has_proxy_auth(raw):
+            need_bridge = True
+        elif host and not _is_loopback_host(host):
+            need_bridge = True
+    if need_bridge:
         bridge = LocalAuthProxyBridge(raw)
         local_proxy = bridge.start()
-        logger("started authenticated proxy bridge: %s" % local_proxy)
+        logger("started chromium proxy bridge: %s -> %s" % (local_proxy, proxy_log_label(raw)))
         return local_proxy, bridge
     return proxy_for_chromium(raw), None
 

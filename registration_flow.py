@@ -2,6 +2,17 @@
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional, Tuple
 
+try:
+    from proxy_manager import (
+        rotate_session as _rotate_proxy_session,
+        is_placeholder_configured as _proxy_uses_placeholder,
+        diagnose_egress as _diagnose_egress,
+    )
+except Exception:
+    _rotate_proxy_session = None
+    _proxy_uses_placeholder = lambda: False
+    _diagnose_egress = None
+
 
 @dataclass
 class RegistrationCallbacks:
@@ -222,6 +233,7 @@ def _prepare_next_account(result, settings, callbacks, ops):
         result.cancelled = True
         return False
     try:
+        _rotate_proxy_for_new_account(callbacks)
         if ops.browser_missing():
             ops.start_browser()
         else:
@@ -232,6 +244,40 @@ def _prepare_next_account(result, settings, callbacks, ops):
         result.cancelled = True
         callbacks.log("[!] 已在账号间准备阶段停止")
         return False
+
+
+def _rotate_proxy_for_new_account(callbacks):
+    """如果 proxy 配置包含 {rand}/{session}，为下一个账号生成新的 session id。"""
+    if _rotate_proxy_session is None:
+        return
+    try:
+        if not _proxy_uses_placeholder():
+            return
+        session_id = _rotate_proxy_session(reason="new-account")
+        callbacks.log(f"[*] 代理会话已轮转 session={session_id[:8]}…")
+    except Exception as exc:
+        callbacks.log(f"[Debug] 轮转代理 session 失败: {exc}")
+
+
+def _egress_selfcheck(callbacks):
+    """启动时打一次 ipinfo.io，把出口 ASN/国家/hosting 布尔打印到日志。"""
+    if _diagnose_egress is None:
+        return
+    try:
+        from app_config import config as _cfg
+        if not _cfg.get("proxy_ipcheck", True):
+            return
+        # 无任何代理配置时直接跳过：避免测试/无网络环境阻塞启动
+        has_proxy = bool(str(_cfg.get("proxy", "") or "").strip())
+        has_pool = bool(_cfg.get("proxy_pool") or [])
+        if not (has_proxy or has_pool):
+            return
+    except Exception:
+        pass
+    try:
+        _diagnose_egress(logger=callbacks.log)
+    except Exception as exc:
+        callbacks.log(f"[Debug] 出口自检异常，已忽略: {exc}")
 
 
 def run_batch(count, callbacks, observer, ops, enable_nsfw=True, cleanup_interval=5,
@@ -248,6 +294,8 @@ def run_batch(count, callbacks, observer, ops, enable_nsfw=True, cleanup_interva
     retry_count_for_slot = 0
     last_cleanup_success_count = 0
     try:
+        _rotate_proxy_for_new_account(callbacks)
+        _egress_selfcheck(callbacks)
         ops.start_browser()
         callbacks.log("[*] 浏览器已启动")
         while result.processed_count < settings.count:

@@ -21,7 +21,17 @@ def configure_runtime(config_ref, extension_path=""):
 
 
 def get_configured_proxy():
-    return str(_config.get("proxy", "") or "").strip()
+    """返回当前号应使用的代理 URL。
+
+    proxy_pool 非空时由 proxy_manager.expand_proxy 选池条目；
+    池为空时回退 config.proxy。两者皆空返回 ""。
+    """
+    raw = str(_config.get("proxy", "") or "").strip()
+    try:
+        from proxy_manager import expand_proxy
+        return expand_proxy(raw)
+    except Exception:
+        return raw
 
 
 def get_proxies():
@@ -122,33 +132,62 @@ def prepare_browser_proxy(use_proxy=True, log_callback=None):
         if log_callback:
             log_callback("[!] Chromium 暂不直接支持该认证代理协议，已使用去认证代理地址，失败将回退直连")
         return stripped, None
-    logger = None
-    if log_callback:
-        logger = lambda message: log_callback("[*] 已为 Chromium启动本地认证代理桥: %s" % message.split(": ", 1)[-1]) if "started authenticated proxy bridge" in message else log_callback(message)
+    def logger(message):
+        if not log_callback:
+            return
+        if "proxy bridge" in message:
+            log_callback("[*] 已为 Chromium 启动本地代理桥: %s" % message.split(": ", 1)[-1])
+        else:
+            log_callback(message)
     return prepare_chromium_proxy(proxy, log=logger)
 
 
 def apply_browser_proxy_option(options, proxy):
+    """给 Chromium 设代理。
+
+    Windows 实测：``--proxy-server`` 会卡 CDP；手测可用的是 PAC：
+    localhost 走 DIRECT，其余走 PROXY host:port（本机桥）。
+    """
     if not proxy:
         return
-    if hasattr(options, "set_proxy"):
-        try:
-            options.set_proxy(proxy)
-            return
-        except Exception:
-            pass
-    if not hasattr(options, "set_argument"):
-        raise AttributeError("当前 DrissionPage ChromiumOptions 不支持设置浏览器代理")
+    raw = str(proxy or "").strip()
+    parsed = _parse_proxy_url(raw)
+    if not parsed or not parsed.hostname:
+        return
     try:
-        options.set_argument("--proxy-server=%s" % proxy)
+        port = parsed.port
+    except Exception:
+        port = None
+    if not port:
+        port = 443 if (parsed.scheme or "http").lower() == "https" else 80
+    host = parsed.hostname
+    if not hasattr(options, "set_argument"):
+        if hasattr(options, "set_proxy") and not raw.lower().startswith("socks"):
+            options.set_proxy(raw)
+        return
+    pac = (
+        "function FindProxyForURL(url, host) {"
+        "  if (host == '127.0.0.1' || host == 'localhost' || host == '::1'"
+        "      || host == '[::1]' || shExpMatch(host, '*.local')) {"
+        "    return 'DIRECT';"
+        "  }"
+        "  return 'PROXY %s:%s';"
+        "}"
+    ) % (host, port)
+    pac_url = "data:application/x-ns-proxy-autoconfig," + urllib.parse.quote(pac)
+    try:
+        options.set_argument("--proxy-pac-url", pac_url)
     except TypeError:
-        options.set_argument("--proxy-server", proxy)
+        options.set_argument("--proxy-pac-url=%s" % pac_url)
 
 
 def create_browser_options(browser_proxy="", extension_path=None):
     options = ChromiumOptions()
     options.auto_port()
-    options.set_timeouts(base=1)
+    try:
+        options.set_timeouts(base=10, page_load=60, script=30)
+    except TypeError:
+        options.set_timeouts(base=10)
     apply_browser_proxy_option(options, browser_proxy)
     effective_extension = _extension_path if extension_path is None else str(extension_path or "")
     if effective_extension and os.path.exists(effective_extension):

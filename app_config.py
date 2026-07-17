@@ -20,6 +20,9 @@ DEFAULT_CONFIG = {
     "cloudmail_domains": "",
     "cloudmail_path_messages": "/api/public/emailList",
     "proxy": "",
+    "proxy_pool": [],
+    "proxy_pool_strategy": "round_robin",
+    "proxy_ipcheck": True,
     "enable_nsfw": True,
     "register_count": 1,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -98,7 +101,7 @@ def validate_config_structure(raw):
         "enable_nsfw", "grok2api_auto_add_local", "grok2api_auto_add_remote",
         "grok2api_allow_legacy_full_save", "cpa_export_enabled",
         "cpa_copy_to_hotload", "cpa_headless", "cpa_force_standalone",
-        "cpa_mint_cookie_inject",
+        "cpa_mint_cookie_inject", "proxy_ipcheck",
     )
     for key in bool_keys:
         cfg[key] = _require_bool(cfg, key)
@@ -110,6 +113,26 @@ def validate_config_structure(raw):
     path_keys = {"grok2api_local_token_file", "api_reverse_tools", "cpa_auth_dir", "cpa_hotload_dir"}
     for key in string_keys:
         cfg[key] = _require_string(cfg, key, path=key in path_keys)
+
+    proxy_pool = cfg.get("proxy_pool", [])
+    if not isinstance(proxy_pool, list):
+        raise ConfigError("配置项 proxy_pool 必须是字符串数组")
+    normalized_pool = []
+    for entry in proxy_pool:
+        if not isinstance(entry, str):
+            raise ConfigError("proxy_pool 中的每一项都必须是字符串")
+        stripped = entry.strip()
+        if not stripped:
+            continue
+        if "\x00" in stripped:
+            raise ConfigError("proxy_pool 条目包含非法空字符")
+        normalized_pool.append(stripped)
+    cfg["proxy_pool"] = normalized_pool
+
+    strategy = str(cfg.get("proxy_pool_strategy", "round_robin") or "round_robin").strip()
+    if strategy not in ("round_robin", "random", "sticky"):
+        raise ConfigError(f"配置项 proxy_pool_strategy 值无效: {strategy!r}; 允许 round_robin/random/sticky")
+    cfg["proxy_pool_strategy"] = strategy
     enums = {
         "email_provider": {"duckmail", "yyds", "cloudflare", "cloudmail"},
         "cloudflare_auth_mode": {"query-key", "bearer", "x-api-key", "x-admin-auth", "none"},
