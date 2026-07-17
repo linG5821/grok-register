@@ -266,58 +266,82 @@ def enable_nsfw_for_token(
                 except Exception:
                     pass
 
-        if log_callback:
-            log_callback("[*] 浏览器打开 https://grok.com/ …")
-        try:
-            _page_get_with_timeout(the_page, "https://grok.com/", timeout=25, log_callback=log_callback)
-        except Exception as nav_exc:
-            return _fallback_http(f"浏览器打开 grok.com 失败: {nav_exc}")
-
-        # 代理错误页 / 空白：尽快放弃 Web，别空转 90s
-        try:
-            if page_has_proxy_error(the_page):
-                return _fallback_http("grok.com 代理错误页")
-        except Exception:
-            pass
-
-        deadline = time.time() + 45
-        cf_ok = False
-        last_click = 0
-        last_progress = 0
-        while time.time() < deadline:
-            time.sleep(1)
+        def _page_state():
             try:
-                state = the_page.run_js(r"""
+                return the_page.run_js(r"""
 var t = String(document.title||'').toLowerCase();
 var b = String(document.body?document.body.innerText||'':'').toLowerCase();
 var c = t.includes('just a moment') || b.includes('verifying you are human') || b.includes('security verification');
 return {challenge:!!c, url:location.href, title:document.title};
                 """) or {}
-            except Exception as js_exc:
-                now = time.time()
-                if log_callback and now - last_progress >= 10:
-                    log_callback(f"[Debug] 等待 grok.com 加载中… ({js_exc})")
-                    last_progress = now
-                continue
-            if not state.get("challenge") and "grok.com" in str(state.get("url", "")).lower():
-                cf_ok = True
-                if log_callback:
-                    log_callback("[*] grok.com 已加载（Cloudflare 已通过）")
-                break
-            now = time.time()
-            if state.get("challenge") and now - last_click >= 5:
-                if _auto_click_cf_turnstile(the_page):
-                    if log_callback:
-                        log_callback("[*] 已自动点击 Turnstile，等待验证...")
-                last_click = now
-            if log_callback and now - last_progress >= 15:
-                log_callback(
-                    f"[Debug] 等待 CF… title={state.get('title')!r} url={state.get('url')!r}"
-                )
-                last_progress = now
+            except Exception:
+                return {}
 
-        if not cf_ok:
-            return _fallback_http("grok.com Cloudflare 超时未通过")
+        # 注册流程：拿到 sso 后可能已在 grok.com（redirect=grok-com），不必再整页重开
+        already_ok = False
+        try:
+            cur = str(getattr(the_page, "url", "") or "")
+            st0 = _page_state()
+            url0 = str(st0.get("url") or cur or "").lower()
+            if "grok.com" in url0 and not st0.get("challenge"):
+                try:
+                    if not page_has_proxy_error(the_page):
+                        already_ok = True
+                except Exception:
+                    already_ok = True
+        except Exception:
+            already_ok = False
+
+        if already_ok:
+            if log_callback:
+                log_callback("[*] 当前已在 grok.com，跳过重新打开页面")
+            cf_ok = True
+        else:
+            if log_callback:
+                log_callback("[*] 浏览器打开 https://grok.com/ …")
+            try:
+                _page_get_with_timeout(the_page, "https://grok.com/", timeout=25, log_callback=log_callback)
+            except Exception as nav_exc:
+                return _fallback_http(f"浏览器打开 grok.com 失败: {nav_exc}")
+
+            try:
+                if page_has_proxy_error(the_page):
+                    return _fallback_http("grok.com 代理错误页")
+            except Exception:
+                pass
+
+            deadline = time.time() + 45
+            cf_ok = False
+            last_click = 0
+            last_progress = 0
+            while time.time() < deadline:
+                time.sleep(1)
+                state = _page_state()
+                if not state:
+                    now = time.time()
+                    if log_callback and now - last_progress >= 10:
+                        log_callback("[Debug] 等待 grok.com 加载中…")
+                        last_progress = now
+                    continue
+                if not state.get("challenge") and "grok.com" in str(state.get("url", "")).lower():
+                    cf_ok = True
+                    if log_callback:
+                        log_callback("[*] grok.com 已加载（Cloudflare 已通过）")
+                    break
+                now = time.time()
+                if state.get("challenge") and now - last_click >= 5:
+                    if _auto_click_cf_turnstile(the_page):
+                        if log_callback:
+                            log_callback("[*] 已自动点击 Turnstile，等待验证...")
+                    last_click = now
+                if log_callback and now - last_progress >= 15:
+                    log_callback(
+                        f"[Debug] 等待 CF… title={state.get('title')!r} url={state.get('url')!r}"
+                    )
+                    last_progress = now
+
+            if not cf_ok:
+                return _fallback_http("grok.com Cloudflare 超时未通过")
 
         try:
             the_page.wait.doc_loaded(timeout=10)
