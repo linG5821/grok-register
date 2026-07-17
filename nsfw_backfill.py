@@ -56,12 +56,16 @@ def parse_accounts_line(line: str, line_no: int = 0) -> Optional[AccountRecord]:
     return AccountRecord(email=email, password=password, sso=sso, line_no=line_no)
 
 
-def load_accounts_file(path: str) -> Tuple[List[AccountRecord], int, int]:
-    """返回 (去重后的账号列表, 总行数, 跳过行数)。同 sso 只保留首次出现。"""
+def load_accounts_file(path: str, seen: Optional[set] = None) -> Tuple[List[AccountRecord], int, int]:
+    """返回 (去重后的账号列表, 总行数, 跳过行数)。同 sso 只保留首次出现。
+
+    seen 可跨文件复用，实现多文件全局 SSO 去重。
+    """
     if not path or not os.path.isfile(path):
         raise FileNotFoundError(f"账号文件不存在: {path}")
+    if seen is None:
+        seen = set()
     records: List[AccountRecord] = []
-    seen = set()
     total = 0
     skipped = 0
     with open(path, "r", encoding="utf-8", errors="replace") as handle:
@@ -79,6 +83,27 @@ def load_accounts_file(path: str) -> Tuple[List[AccountRecord], int, int]:
     return records, total, skipped
 
 
+def load_accounts_files(paths: Sequence[str]) -> Tuple[List[AccountRecord], int, int, List[str]]:
+    """合并多个 accounts 文件，跨文件按 SSO 去重。返回 (records, total, skipped, missing)。"""
+    seen: set = set()
+    records: List[AccountRecord] = []
+    total = 0
+    skipped = 0
+    missing: List[str] = []
+    for path in paths:
+        p = str(path or "").strip()
+        if not p:
+            continue
+        if not os.path.isfile(p):
+            missing.append(p)
+            continue
+        part, t, s = load_accounts_file(p, seen=seen)
+        records.extend(part)
+        total += t
+        skipped += s
+    return records, total, skipped, missing
+
+
 def backfill_nsfw_from_accounts(
     path: str,
     enable_nsfw: EnableNsfwFn,
@@ -87,7 +112,26 @@ def backfill_nsfw_from_accounts(
     delay_sec: float = 1.0,
     sleep_fn: Optional[Callable[[float], None]] = None,
 ) -> BackfillResult:
-    """读取 accounts 文件并对每个 SSO 调用 enable_nsfw(sso, log_callback=...).
+    """读取单个 accounts 文件并补开（兼容旧调用）。"""
+    return backfill_nsfw_from_accounts_files(
+        [path],
+        enable_nsfw=enable_nsfw,
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+        delay_sec=delay_sec,
+        sleep_fn=sleep_fn,
+    )
+
+
+def backfill_nsfw_from_accounts_files(
+    paths: Sequence[str],
+    enable_nsfw: EnableNsfwFn,
+    log_callback: Optional[LogFn] = None,
+    cancel_callback: Optional[CancelFn] = None,
+    delay_sec: float = 1.0,
+    sleep_fn: Optional[Callable[[float], None]] = None,
+) -> BackfillResult:
+    """读取一个或多个 accounts 文件，跨文件 SSO 去重后批量补开。
 
     enable_nsfw 签名兼容 registration_browser.enable_nsfw_for_token。
     """
@@ -108,11 +152,24 @@ def backfill_nsfw_from_accounts(
 
     sleeper = sleep_fn or (lambda _s: None)
     result = BackfillResult()
-    records, total, skipped = load_accounts_file(path)
+    path_list = [str(p).strip() for p in (paths or []) if str(p or "").strip()]
+    if not path_list:
+        raise FileNotFoundError("未选择任何账号文件")
+
+    records, total, skipped, missing = load_accounts_files(path_list)
     result.total_lines = total
     result.skipped = skipped
     result.parsed = len(records)
-    log(f"[*] NSFW 补开：文件={path} 有效={len(records)} 跳过={skipped} 总行={total}")
+    if missing:
+        for m in missing:
+            log(f"[!] 文件不存在，已跳过: {m}")
+    log(
+        f"[*] NSFW 补开：文件数={len(path_list) - len(missing)} 有效={len(records)} "
+        f"跳过={skipped} 总行={total}"
+    )
+    for p in path_list:
+        if os.path.isfile(p):
+            log(f"[*] 输入文件: {p}")
 
     for i, rec in enumerate(records, start=1):
         if cancelled():
@@ -123,7 +180,6 @@ def backfill_nsfw_from_accounts(
         try:
             ok, message = enable_nsfw(rec.sso, log_callback=log_callback)
         except TypeError:
-            # 兼容只接收 token 的简单 mock
             try:
                 ok, message = enable_nsfw(rec.sso)
             except Exception as exc:
@@ -154,11 +210,21 @@ def backfill_nsfw_from_accounts(
 def dry_run_validate_file(path: str) -> BackfillResult:
     """只解析不调用网络，用于验证文件格式是否可走通。"""
     records, total, skipped = load_accounts_file(path)
-    result = BackfillResult(
+    return BackfillResult(
         total_lines=total,
         parsed=len(records),
         skipped=skipped,
         success=0,
         failed=0,
     )
-    return result
+
+
+def dry_run_validate_files(paths: Sequence[str]) -> BackfillResult:
+    records, total, skipped, _missing = load_accounts_files(paths)
+    return BackfillResult(
+        total_lines=total,
+        parsed=len(records),
+        skipped=skipped,
+        success=0,
+        failed=0,
+    )

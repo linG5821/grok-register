@@ -1170,9 +1170,9 @@ class GrokRegisterGUI:
         self.nsfw_backfill_btn.pack(side=tk.LEFT, padx=5)
         self.clear_btn = tk_button(btn_frame, text="清空日志", command=self.clear_log)
         self.clear_btn.pack(side=tk.LEFT, padx=5)
-        self.nsfw_use_browser_var = tk.BooleanVar(value=False)
+        self.nsfw_use_browser_var = tk.BooleanVar(value=True)
         self.nsfw_use_browser_check = tk_checkbutton(
-            btn_frame, text="补开时用浏览器(易卡UI，默认关=HTTP)", variable=self.nsfw_use_browser_var
+            btn_frame, text="补开用浏览器Web(推荐；HTTP易被CF拦)", variable=self.nsfw_use_browser_var
         )
         self.nsfw_use_browser_check.pack(side=tk.LEFT, padx=5)
 
@@ -1381,27 +1381,35 @@ class GrokRegisterGUI:
             self.log("[!] 当前已有任务在运行")
             return
         from tkinter import filedialog
-        path = filedialog.askopenfilename(
-            title="选择 accounts 文件",
+        paths = filedialog.askopenfilenames(
+            title="选择 accounts 文件（可多选）",
             filetypes=[("Accounts", "accounts_*.txt"), ("Text", "*.txt"), ("All", "*.*")],
             initialdir=os.path.dirname(__file__),
         )
-        if not path:
+        paths = [str(p).strip() for p in (paths or ()) if str(p or "").strip()]
+        if not paths:
             return
         use_browser = bool(self.nsfw_use_browser_var.get())
         self.stop_requested = False
         self._set_running_ui(True)
-        self.log(f"[*] 开始 NSFW 补开: {path} (浏览器={'开' if use_browser else '关/HTTP'})")
+        self.log(
+            f"[*] 开始 NSFW 补开: {len(paths)} 个文件 "
+            f"(浏览器Web={'开' if use_browser else '关/HTTP'})"
+        )
+        for p in paths:
+            self.log(f"[*]  - {p}")
         threading.Thread(
             target=self.run_nsfw_backfill,
-            args=(path, use_browser),
+            args=(paths, use_browser),
             daemon=True,
         ).start()
 
-    def run_nsfw_backfill(self, path, use_browser=True):
-        from nsfw_backfill import backfill_nsfw_from_accounts, dry_run_validate_file
+    def run_nsfw_backfill(self, paths, use_browser=True):
+        from nsfw_backfill import backfill_nsfw_from_accounts_files, dry_run_validate_files
+        if isinstance(paths, str):
+            paths = [paths]
         try:
-            preview = dry_run_validate_file(path)
+            preview = dry_run_validate_files(paths)
             self.log(
                 f"[*] 预检：有效账号={preview.parsed} 跳过行={preview.skipped} 总行={preview.total_lines}"
             )
@@ -1409,9 +1417,8 @@ class GrokRegisterGUI:
                 self.log("[!] 文件中没有可处理的账号行（email----password----sso）")
                 return
 
-            # 补开默认 HTTP：整段 enable 若丢主线程会堵住 process_ui_queue →「未响应」
-            # 勾选浏览器时：仅 start/stop 上主线程；enable 仍在本后台线程跑，
-            # 打开 grok.com 失败会 force_http，避免长时间占主线程。
+            # enable 在后台线程跑，避免 call_on_ui_thread 卡死界面；
+            # 仅 start/stop 浏览器走主线程。Web 模式下默认禁用 HTTP 回退（CF 常拦 HTTP）。
             browser_started = False
             if use_browser:
                 try:
@@ -1420,20 +1427,24 @@ class GrokRegisterGUI:
                         timeout=180,
                     )
                     browser_started = True
-                    self.log("[*] 补开浏览器已启动（Web 优先，失败自动 HTTP；不阻塞 UI 主循环）")
+                    self.log("[*] 补开浏览器已启动（Web；失败不回退 HTTP）")
                 except Exception as exc:
-                    self.log(f"[!] 浏览器启动失败，改用 HTTP 补开: {exc}")
+                    self.log(f"[!] 浏览器启动失败: {exc}")
+                    return
 
             def enable(token, log_callback=None):
-                # 绝不把整段 enable 丢进 call_on_ui_thread（会卡死界面）
                 if not browser_started:
                     return enable_nsfw_for_token(
                         token, log_callback=log_callback, force_http=True
                     )
-                return enable_nsfw_for_token(token, log_callback=log_callback)
+                return enable_nsfw_for_token(
+                    token,
+                    log_callback=log_callback,
+                    allow_http_fallback=False,
+                )
 
-            result = backfill_nsfw_from_accounts(
-                path,
+            result = backfill_nsfw_from_accounts_files(
+                paths,
                 enable_nsfw=enable,
                 log_callback=self.log,
                 cancel_callback=self.should_stop,

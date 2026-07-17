@@ -212,6 +212,41 @@ class NsfwBackfillFlowTests(unittest.TestCase):
         self.assertTrue(ok)
         http_mock.assert_called_once()
 
+    def test_multi_file_merge_and_dedupe(self):
+        p1 = self._write(["a@x.com----p----tok1", "b@x.com----p----tok2"])
+        p2 = self._write(["c@x.com----p----tok1", "d@x.com----p----tok3"])  # tok1 跨文件去重
+        calls = []
+
+        def enable(token, log_callback=None):
+            calls.append(token)
+            return True, "ok"
+
+        try:
+            result = nb.backfill_nsfw_from_accounts_files(
+                [p1, p2], enable_nsfw=enable, delay_sec=0
+            )
+        finally:
+            os.unlink(p1)
+            os.unlink(p2)
+
+        self.assertEqual(result.parsed, 3)
+        self.assertEqual(calls, ["tok1", "tok2", "tok3"])
+        self.assertEqual(result.success, 3)
+
+    def test_allow_http_fallback_false(self):
+        import registration_browser as rb
+
+        rb.page = object()
+        with patch.object(rb, "_clear_auth_cookies"), \
+                patch.object(rb, "_page_get_with_timeout", side_effect=RuntimeError("nav fail")), \
+                patch.object(rb, "_enable_nsfw_http") as http_mock:
+            ok, msg = rb.enable_nsfw_for_token(
+                "tok", allow_http_fallback=False, log_callback=None
+            )
+        self.assertFalse(ok)
+        self.assertIn("无HTTP回退", msg)
+        http_mock.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

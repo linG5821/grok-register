@@ -184,7 +184,38 @@ def _page_get_with_timeout(the_page, url, timeout=25, log_callback=None):
         pass
 
 
-def enable_nsfw_for_token(token, cf_clearance="", log_callback=None, force_http=False):
+def _clear_auth_cookies(the_page, log_callback=None):
+    """换号前尽量清掉 x.ai/grok 登录 cookie，降低共用浏览器串号。"""
+    if the_page is None:
+        return
+    names = ("sso", "sso-rw", "cf_clearance", "__cf_bm")
+    domains = (".x.ai", "accounts.x.ai", ".grok.com", "grok.com")
+    # DrissionPage: 优先 set.cookies.clear / cookies.clear
+    for clearer in (
+        lambda: the_page.set.cookies.clear(),
+        lambda: the_page.cookies.clear(),
+    ):
+        try:
+            clearer()
+            if log_callback:
+                log_callback("[Debug] 已清理浏览器 cookie")
+            return
+        except Exception:
+            pass
+    for domain in domains:
+        for name in names:
+            try:
+                the_page.set.cookies.remove(name, domain=domain)
+            except Exception:
+                try:
+                    the_page.set.cookies([{
+                        "name": name, "value": "", "domain": domain, "path": "/", "secure": True,
+                    }])
+                except Exception:
+                    pass
+
+
+def enable_nsfw_for_token(token, cf_clearance="", log_callback=None, force_http=False, allow_http_fallback=True):
     global page
 
     sso = str(token or "").strip()
@@ -202,7 +233,17 @@ def enable_nsfw_for_token(token, cf_clearance="", log_callback=None, force_http=
                 log_callback("[Debug] 无浏览器页面，回退 HTTP 模式")
         return _enable_nsfw_http(token, cf_clearance=cf_clearance, log_callback=log_callback)
 
+    def _fallback_http(reason):
+        if not allow_http_fallback:
+            if log_callback:
+                log_callback(f"[!] Web 失败且已禁用 HTTP 回退: {reason}")
+            return False, f"web 失败(无HTTP回退): {reason}"
+        if log_callback:
+            log_callback(f"[!] {reason}，回退 HTTP")
+        return _enable_nsfw_http(token, cf_clearance=cf_clearance, log_callback=log_callback)
+
     try:
+        _clear_auth_cookies(the_page, log_callback=log_callback)
         for domain in (".x.ai", "accounts.x.ai", ".grok.com", "grok.com"):
             for name in ("sso", "sso-rw"):
                 try:
@@ -217,16 +258,12 @@ def enable_nsfw_for_token(token, cf_clearance="", log_callback=None, force_http=
         try:
             _page_get_with_timeout(the_page, "https://grok.com/", timeout=25, log_callback=log_callback)
         except Exception as nav_exc:
-            if log_callback:
-                log_callback(f"[!] 浏览器打开 grok.com 失败，回退 HTTP: {nav_exc}")
-            return _enable_nsfw_http(token, cf_clearance=cf_clearance, log_callback=log_callback)
+            return _fallback_http(f"浏览器打开 grok.com 失败: {nav_exc}")
 
         # 代理错误页 / 空白：尽快放弃 Web，别空转 90s
         try:
             if page_has_proxy_error(the_page):
-                if log_callback:
-                    log_callback("[!] grok.com 代理错误页，回退 HTTP")
-                return _enable_nsfw_http(token, cf_clearance=cf_clearance, log_callback=log_callback)
+                return _fallback_http("grok.com 代理错误页")
         except Exception:
             pass
 
@@ -267,9 +304,7 @@ return {challenge:!!c, url:location.href, title:document.title};
                 last_progress = now
 
         if not cf_ok:
-            if log_callback:
-                log_callback("[!] grok.com Cloudflare 超时未通过，回退 HTTP 模式")
-            return _enable_nsfw_http(token, cf_clearance=cf_clearance, log_callback=log_callback)
+            return _fallback_http("grok.com Cloudflare 超时未通过")
 
         try:
             the_page.wait.doc_loaded(timeout=10)
@@ -363,9 +398,9 @@ fetch('/rest/app-chat/conversations?pageSize=1',{credentials:'include'});
 
     except Exception as e:
         if log_callback:
-            log_callback(f"[Debug] 浏览器 NSFW 异常，回退 HTTP: {e}")
+            log_callback(f"[Debug] 浏览器 NSFW 异常: {e}")
         try:
-            return _enable_nsfw_http(token, cf_clearance=cf_clearance, log_callback=log_callback)
+            return _fallback_http(f"浏览器模式异常: {e}")
         except Exception as http_exc:
             return False, f"浏览器模式异常: {e}; HTTP 回退也失败: {http_exc}"
 
