@@ -161,6 +161,29 @@ def update_nsfw_settings(session, log_callback=None):
             log_callback(f"[update_nsfw] 异常: {e}")
         return False, f"update_nsfw_settings 异常: {e}"
 
+def _page_get_with_timeout(the_page, url, timeout=25, log_callback=None):
+    """打开 URL；须在持有 CDP 的线程（GUI 下为 Tk 主线程）调用。
+
+    使用 DrissionPage 的 page timeout；失败/代理错误页则抛错，由上层回退 HTTP。
+    """
+    try:
+        the_page.get(url, timeout=timeout)
+    except TypeError:
+        # 旧版签名无 timeout：依赖 options page_load 超时
+        the_page.get(url)
+    except Exception as exc:
+        raise RuntimeError(f"打开 {url} 失败: {exc}") from exc
+    try:
+        if page_has_proxy_error(the_page):
+            raise RuntimeError(f"打开 {url} 时浏览器显示代理错误")
+    except NameError:
+        pass
+    except RuntimeError:
+        raise
+    except Exception:
+        pass
+
+
 def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
     global page
 
@@ -186,23 +209,28 @@ def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
                 except Exception:
                     pass
 
+        if log_callback:
+            log_callback("[*] 浏览器打开 https://grok.com/ …")
         try:
-            the_page.get("https://grok.com/")
-        except Exception:
-            the_page = refresh_active_page()
-            for domain in (".x.ai", "accounts.x.ai", ".grok.com", "grok.com"):
-                for name in ("sso", "sso-rw"):
-                    try:
-                        the_page.set.cookies([
-                            {"name": name, "value": sso, "domain": domain, "path": "/", "secure": True}
-                        ])
-                    except Exception:
-                        pass
-            the_page.get("https://grok.com/")
+            _page_get_with_timeout(the_page, "https://grok.com/", timeout=25, log_callback=log_callback)
+        except Exception as nav_exc:
+            if log_callback:
+                log_callback(f"[!] 浏览器打开 grok.com 失败，回退 HTTP: {nav_exc}")
+            return _enable_nsfw_http(token, cf_clearance=cf_clearance, log_callback=log_callback)
 
-        deadline = time.time() + 90
+        # 代理错误页 / 空白：尽快放弃 Web，别空转 90s
+        try:
+            if page_has_proxy_error(the_page):
+                if log_callback:
+                    log_callback("[!] grok.com 代理错误页，回退 HTTP")
+                return _enable_nsfw_http(token, cf_clearance=cf_clearance, log_callback=log_callback)
+        except Exception:
+            pass
+
+        deadline = time.time() + 45
         cf_ok = False
         last_click = 0
+        last_progress = 0
         while time.time() < deadline:
             time.sleep(1)
             try:
@@ -212,7 +240,11 @@ var b = String(document.body?document.body.innerText||'':'').toLowerCase();
 var c = t.includes('just a moment') || b.includes('verifying you are human') || b.includes('security verification');
 return {challenge:!!c, url:location.href, title:document.title};
                 """) or {}
-            except Exception:
+            except Exception as js_exc:
+                now = time.time()
+                if log_callback and now - last_progress >= 10:
+                    log_callback(f"[Debug] 等待 grok.com 加载中… ({js_exc})")
+                    last_progress = now
                 continue
             if not state.get("challenge") and "grok.com" in str(state.get("url", "")).lower():
                 cf_ok = True
@@ -225,11 +257,16 @@ return {challenge:!!c, url:location.href, title:document.title};
                     if log_callback:
                         log_callback("[*] 已自动点击 Turnstile，等待验证...")
                 last_click = now
+            if log_callback and now - last_progress >= 15:
+                log_callback(
+                    f"[Debug] 等待 CF… title={state.get('title')!r} url={state.get('url')!r}"
+                )
+                last_progress = now
 
         if not cf_ok:
             if log_callback:
-                log_callback("[!] grok.com Cloudflare 超时未通过，跳过 NSFW 激活")
-            return False, "grok.com CF 超时"
+                log_callback("[!] grok.com Cloudflare 超时未通过，回退 HTTP 模式")
+            return _enable_nsfw_http(token, cf_clearance=cf_clearance, log_callback=log_callback)
 
         try:
             the_page.wait.doc_loaded(timeout=10)
@@ -323,8 +360,11 @@ fetch('/rest/app-chat/conversations?pageSize=1',{credentials:'include'});
 
     except Exception as e:
         if log_callback:
-            log_callback(f"[Debug] 浏览器 NSFW 异常: {e}")
-        return False, f"浏览器模式异常: {e}"
+            log_callback(f"[Debug] 浏览器 NSFW 异常，回退 HTTP: {e}")
+        try:
+            return _enable_nsfw_http(token, cf_clearance=cf_clearance, log_callback=log_callback)
+        except Exception as http_exc:
+            return False, f"浏览器模式异常: {e}; HTTP 回退也失败: {http_exc}"
 
 
 def _enable_nsfw_http(token, cf_clearance="", log_callback=None):

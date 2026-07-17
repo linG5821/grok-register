@@ -1411,6 +1411,12 @@ class GrokRegisterGUI:
                     self.log(f"[!] 浏览器启动失败，回退 HTTP 补开: {exc}")
 
             def enable(token, log_callback=None):
+                # Windows：page.get/CDP 必须在 Tk 主线程；后台线程调会假死无日志
+                if browser_started:
+                    return self.call_on_ui_thread(
+                        lambda: enable_nsfw_for_token(token, log_callback=log_callback),
+                        timeout=120,
+                    )
                 return enable_nsfw_for_token(token, log_callback=log_callback)
 
             result = backfill_nsfw_from_accounts(
