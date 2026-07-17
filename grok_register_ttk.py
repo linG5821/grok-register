@@ -1437,10 +1437,12 @@ class GrokRegisterGUI:
                     return enable_nsfw_for_token(
                         token, log_callback=log_callback, force_http=True
                     )
+                # 补开多号共用浏览器：换号前清 cookie；注册流程不传 clear_cookies
                 return enable_nsfw_for_token(
                     token,
                     log_callback=log_callback,
                     allow_http_fallback=False,
+                    clear_cookies=True,
                 )
 
             result = backfill_nsfw_from_accounts_files(

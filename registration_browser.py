@@ -215,7 +215,19 @@ def _clear_auth_cookies(the_page, log_callback=None):
                     pass
 
 
-def enable_nsfw_for_token(token, cf_clearance="", log_callback=None, force_http=False, allow_http_fallback=True):
+def enable_nsfw_for_token(
+    token,
+    cf_clearance="",
+    log_callback=None,
+    force_http=False,
+    allow_http_fallback=True,
+    clear_cookies=False,
+):
+    """开启 NSFW。
+
+    clear_cookies: 仅批量补开（多号共用浏览器）时应为 True。
+    注册流程默认 False，避免刚拿到的 sso/cf_clearance 被清掉。
+    """
     global page
 
     sso = str(token or "").strip()
@@ -243,7 +255,8 @@ def enable_nsfw_for_token(token, cf_clearance="", log_callback=None, force_http=
         return _enable_nsfw_http(token, cf_clearance=cf_clearance, log_callback=log_callback)
 
     try:
-        _clear_auth_cookies(the_page, log_callback=log_callback)
+        if clear_cookies:
+            _clear_auth_cookies(the_page, log_callback=log_callback)
         for domain in (".x.ai", "accounts.x.ai", ".grok.com", "grok.com"):
             for name in ("sso", "sso-rw"):
                 try:

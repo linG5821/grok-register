@@ -247,6 +247,29 @@ class NsfwBackfillFlowTests(unittest.TestCase):
         self.assertIn("无HTTP回退", msg)
         http_mock.assert_not_called()
 
+    def test_registration_default_does_not_clear_cookies(self):
+        """注册后开 NSFW 默认 clear_cookies=False，不应清会话。"""
+        import registration_browser as rb
+
+        rb.page = object()
+        with patch.object(rb, "_clear_auth_cookies") as clear_mock, \
+                patch.object(rb, "_page_get_with_timeout", side_effect=RuntimeError("nav")), \
+                patch.object(rb, "_enable_nsfw_http", return_value=(True, "http")):
+            rb.enable_nsfw_for_token("tok", log_callback=None)
+        clear_mock.assert_not_called()
+
+    def test_backfill_clear_cookies_when_requested(self):
+        import registration_browser as rb
+
+        rb.page = object()
+        with patch.object(rb, "_clear_auth_cookies") as clear_mock, \
+                patch.object(rb, "_page_get_with_timeout", side_effect=RuntimeError("nav")), \
+                patch.object(rb, "_enable_nsfw_http", return_value=(False, "x")):
+            rb.enable_nsfw_for_token(
+                "tok", clear_cookies=True, allow_http_fallback=False
+            )
+        clear_mock.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
