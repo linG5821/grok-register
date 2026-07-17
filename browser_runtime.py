@@ -185,9 +185,14 @@ def create_browser_options(browser_proxy="", extension_path=None):
     options = ChromiumOptions()
     options.auto_port()
     try:
-        options.set_timeouts(base=10, page_load=60, script=30)
+        options.set_timeouts(base=15, page_load=60, script=30)
     except TypeError:
-        options.set_timeouts(base=10)
+        options.set_timeouts(base=15)
+    try:
+        if hasattr(options, "set_retry"):
+            options.set_retry(times=5, interval=1)
+    except Exception:
+        pass
     apply_browser_proxy_option(options, browser_proxy)
     effective_extension = _extension_path if extension_path is None else str(extension_path or "")
     if effective_extension and os.path.exists(effective_extension):

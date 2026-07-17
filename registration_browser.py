@@ -414,12 +414,52 @@ def stop_browser_proxy_bridge():
             pass
     browser_proxy_bridge = None
 
+def _configure_drission_connect_timeouts():
+    """Windows 冷启动 Chrome 常 >30s；默认 browser_connect_timeout=30 会导致首次失败。"""
+    try:
+        from DrissionPage._functions.settings import Settings as _Settings
+        # 首次启动（杀软扫盘/写 user-data）在 Win 上经常 20–50s
+        if getattr(_Settings, "browser_connect_timeout", 30) < 90:
+            _Settings.set_browser_connect_timeout(90)
+        if getattr(_Settings, "cdp_timeout", 30) < 60:
+            _Settings.set_cdp_timeout(60)
+    except Exception:
+        pass
+
+
+def _cleanup_orphaned_debug_browser(options, log_callback=None):
+    """Chromium() 超时失败时，Popen 起的 Chrome 往往仍在跑；尝试挂接后关掉，避免占端口/资料目录。"""
+    address = str(getattr(options, "address", "") or "").strip()
+    if not address:
+        return
+    try:
+        from DrissionPage import ChromiumOptions
+        orphan_opts = ChromiumOptions()
+        orphan_opts.set_address(address)
+        if hasattr(orphan_opts, "existing_only"):
+            orphan_opts.existing_only()
+        orphan = Chromium(orphan_opts)
+        try:
+            orphan.quit(timeout=3, force=True, del_data=True)
+        except TypeError:
+            try:
+                orphan.quit(del_data=True)
+            except Exception:
+                pass
+        if log_callback:
+            log_callback(f"[Debug] 已清理失败启动残留浏览器: {address}")
+    except Exception:
+        pass
+
+
 def start_browser(log_callback=None, use_proxy=True):
     global browser, page, browser_proxy_bridge, browser_started_with_proxy
+    _configure_drission_connect_timeouts()
     last_exc = None
     proxy_enabled = bool(use_proxy and get_configured_proxy())
     for attempt in range(1, 5):
         bridge = None
+        options = None
         try:
             browser_proxy, bridge = prepare_browser_proxy(use_proxy=use_proxy, log_callback=log_callback)
             if log_callback:
@@ -428,12 +468,26 @@ def start_browser(log_callback=None, use_proxy=True):
                 else:
                     log_callback(f"[*] 正在启动 Chromium（直连，第 {attempt}/4 次）…")
             options = create_browser_options(browser_proxy=browser_proxy)
+            # 干净 user-data，减少上次崩溃锁文件导致的首次连不上
+            try:
+                if hasattr(options, "new_env"):
+                    options.new_env()
+            except Exception:
+                pass
+            try:
+                if hasattr(options, "set_retry"):
+                    options.set_retry(times=5, interval=1)
+            except Exception:
+                pass
             if log_callback:
                 try:
                     args = list(getattr(options, "arguments", []) or [])
                     log_callback(
                         f"[Debug] proxy_args={[a for a in args if 'proxy' in str(a).lower()]}"
                     )
+                    addr = getattr(options, "address", None)
+                    if addr:
+                        log_callback(f"[Debug] CDP address={addr}")
                     # 若环境变量仍带代理，Chrome 会继承并搞挂 CDP（脚本不过 env 所以能过）
                     env_proxy = {
                         k: os.environ.get(k)
@@ -465,8 +519,20 @@ def start_browser(log_callback=None, use_proxy=True):
             browser_started_with_proxy = bool(browser_proxy)
             if log_callback:
                 log_callback("[*] Chromium 已连接，正在获取标签页…")
-            tabs = browser.get_tabs()
-            page = tabs[-1] if tabs else browser.new_tab()
+            # get_tabs 偶发在刚连上时为空/抛错，短重试
+            page = None
+            for tab_try in range(5):
+                try:
+                    tabs = browser.get_tabs()
+                    page = tabs[-1] if tabs else browser.new_tab()
+                    if page is not None:
+                        break
+                except Exception as tab_exc:
+                    if tab_try >= 4:
+                        raise
+                    if log_callback and tab_try == 0:
+                        log_callback(f"[Debug] 获取标签页重试: {tab_exc}")
+                    time.sleep(0.4 * (tab_try + 1))
             if log_callback and getattr(browser, "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
             if log_callback and get_configured_proxy():
@@ -484,17 +550,21 @@ def start_browser(log_callback=None, use_proxy=True):
                     pass
             if log_callback:
                 mode = "代理" if proxy_enabled else "直连"
-                log_callback(f"[Debug] 浏览器{mode}启动失败(第{attempt}/4次): {exc}")
+                log_callback(f"[Debug] 浏览器{mode}启动失败(第{attempt}/4次): {type(exc).__name__}: {exc}")
             try:
                 if browser is not None:
                     browser.quit(del_data=True)
             except Exception:
                 pass
+            # Chromium() 构造失败时 browser 仍是 None，但系统里可能已有半拉子 Chrome
+            if options is not None:
+                _cleanup_orphaned_debug_browser(options, log_callback=log_callback)
             browser = None
             page = None
             browser_proxy_bridge = None
             browser_started_with_proxy = False
-            time.sleep(min(1.5 * attempt, 4))
+            # 首次失败多等一会：给杀软/磁盘释放时间，也避免立刻撞残留进程
+            time.sleep(min(2.0 * attempt, 6))
     raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
 def stop_browser():
