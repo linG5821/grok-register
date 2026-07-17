@@ -1170,9 +1170,9 @@ class GrokRegisterGUI:
         self.nsfw_backfill_btn.pack(side=tk.LEFT, padx=5)
         self.clear_btn = tk_button(btn_frame, text="清空日志", command=self.clear_log)
         self.clear_btn.pack(side=tk.LEFT, padx=5)
-        self.nsfw_use_browser_var = tk.BooleanVar(value=True)
+        self.nsfw_use_browser_var = tk.BooleanVar(value=False)
         self.nsfw_use_browser_check = tk_checkbutton(
-            btn_frame, text="补开时用浏览器", variable=self.nsfw_use_browser_var
+            btn_frame, text="补开时用浏览器(易卡UI，默认关=HTTP)", variable=self.nsfw_use_browser_var
         )
         self.nsfw_use_browser_check.pack(side=tk.LEFT, padx=5)
 
@@ -1252,7 +1252,11 @@ class GrokRegisterGUI:
                 pass
 
     def call_on_ui_thread(self, func, timeout=180):
-        """把 func 调度到 Tk 主线程并等待结果。已在主线程则直接调用。"""
+        """把 func 调度到 Tk 主线程并等待结果。已在主线程则直接调用。
+
+        注意：func 若长时间阻塞，仍会卡住 UI（process_ui_queue 同步执行 call）。
+        仅用于 start/stop 浏览器等短操作；禁止把整段 enable_nsfw/网络循环放进来。
+        """
         if threading.current_thread() is threading.main_thread():
             return func()
         done = queue.Queue(maxsize=1)
@@ -1264,10 +1268,17 @@ class GrokRegisterGUI:
                 done.put(("err", exc))
 
         self.ui_queue.put(("call", runner))
-        try:
-            kind, payload = done.get(timeout=timeout)
-        except queue.Empty:
-            raise TimeoutError(f"主线程调用超时（{timeout}s）")
+        # 等待期间让出 GIL；主线程 process_ui_queue 会跑 runner
+        deadline = time.time() + float(timeout)
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(f"主线程调用超时（{timeout}s）")
+            try:
+                kind, payload = done.get(timeout=min(0.2, remaining))
+                break
+            except queue.Empty:
+                continue
         if kind == "err":
             raise payload
         return payload
@@ -1398,6 +1409,9 @@ class GrokRegisterGUI:
                 self.log("[!] 文件中没有可处理的账号行（email----password----sso）")
                 return
 
+            # 补开默认 HTTP：整段 enable 若丢主线程会堵住 process_ui_queue →「未响应」
+            # 勾选浏览器时：仅 start/stop 上主线程；enable 仍在本后台线程跑，
+            # 打开 grok.com 失败会 force_http，避免长时间占主线程。
             browser_started = False
             if use_browser:
                 try:
@@ -1406,16 +1420,15 @@ class GrokRegisterGUI:
                         timeout=180,
                     )
                     browser_started = True
-                    self.log("[*] 补开浏览器已启动（Web 路径）")
+                    self.log("[*] 补开浏览器已启动（Web 优先，失败自动 HTTP；不阻塞 UI 主循环）")
                 except Exception as exc:
-                    self.log(f"[!] 浏览器启动失败，回退 HTTP 补开: {exc}")
+                    self.log(f"[!] 浏览器启动失败，改用 HTTP 补开: {exc}")
 
             def enable(token, log_callback=None):
-                # Windows：page.get/CDP 必须在 Tk 主线程；后台线程调会假死无日志
-                if browser_started:
-                    return self.call_on_ui_thread(
-                        lambda: enable_nsfw_for_token(token, log_callback=log_callback),
-                        timeout=120,
+                # 绝不把整段 enable 丢进 call_on_ui_thread（会卡死界面）
+                if not browser_started:
+                    return enable_nsfw_for_token(
+                        token, log_callback=log_callback, force_http=True
                     )
                 return enable_nsfw_for_token(token, log_callback=log_callback)
 

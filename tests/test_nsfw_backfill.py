@@ -202,6 +202,16 @@ class NsfwBackfillFlowTests(unittest.TestCase):
         http_mock.assert_called_once()
         self.assertEqual(http_mock.call_args[0][0], "jwt-integration")
 
+    def test_force_http_skips_browser_even_if_page_set(self):
+        import registration_browser as rb
+
+        rb.page = object()  # 假页面：若误走 Web 会炸
+        with patch.object(rb, "_enable_nsfw_http", return_value=(True, "http")) as http_mock, \
+                patch.object(rb, "_page_get_with_timeout", side_effect=AssertionError("should not web")):
+            ok, msg = rb.enable_nsfw_for_token("tok", force_http=True)
+        self.assertTrue(ok)
+        http_mock.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

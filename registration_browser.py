@@ -184,7 +184,7 @@ def _page_get_with_timeout(the_page, url, timeout=25, log_callback=None):
         pass
 
 
-def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
+def enable_nsfw_for_token(token, cf_clearance="", log_callback=None, force_http=False):
     global page
 
     sso = str(token or "").strip()
@@ -194,9 +194,12 @@ def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
         return False, "token 为空"
 
     the_page = page
-    if the_page is None:
+    if force_http or the_page is None:
         if log_callback:
-            log_callback("[Debug] 无浏览器页面，回退 HTTP 模式")
+            if force_http:
+                log_callback("[Debug] 强制 HTTP 模式开启 NSFW")
+            else:
+                log_callback("[Debug] 无浏览器页面，回退 HTTP 模式")
         return _enable_nsfw_http(token, cf_clearance=cf_clearance, log_callback=log_callback)
 
     try:
