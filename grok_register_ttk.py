@@ -1166,8 +1166,15 @@ class GrokRegisterGUI:
         self.start_btn.pack(side=tk.LEFT, padx=5)
         self.stop_btn = tk_button(btn_frame, text="停止", command=self.stop_registration, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
+        self.nsfw_backfill_btn = tk_button(btn_frame, text="补开 NSFW", command=self.start_nsfw_backfill)
+        self.nsfw_backfill_btn.pack(side=tk.LEFT, padx=5)
         self.clear_btn = tk_button(btn_frame, text="清空日志", command=self.clear_log)
         self.clear_btn.pack(side=tk.LEFT, padx=5)
+        self.nsfw_use_browser_var = tk.BooleanVar(value=True)
+        self.nsfw_use_browser_check = tk_checkbutton(
+            btn_frame, text="补开时用浏览器", variable=self.nsfw_use_browser_var
+        )
+        self.nsfw_use_browser_check.pack(side=tk.LEFT, padx=5)
 
         status_frame = tk.Frame(main_frame, bg=UI_BG)
         status_frame.grid(row=2, column=0, sticky=tk.EW, pady=(0, 6))
@@ -1225,6 +1232,8 @@ class GrokRegisterGUI:
                     running = bool(event[1])
                     self.start_btn.config(state=tk.DISABLED if running else tk.NORMAL)
                     self.stop_btn.config(state=tk.NORMAL if running else tk.DISABLED)
+                    if hasattr(self, "nsfw_backfill_btn"):
+                        self.nsfw_backfill_btn.config(state=tk.DISABLED if running else tk.NORMAL)
                     self.status_var.set("运行中..." if running else "就绪")
                     self.status_label.config(foreground="blue" if running else "green")
                 elif kind == "error":
@@ -1355,6 +1364,80 @@ class GrokRegisterGUI:
     def stop_registration(self):
         self.stop_requested = True
         self.log("[!] 用户停止注册")
+
+    def start_nsfw_backfill(self):
+        if self.is_running:
+            self.log("[!] 当前已有任务在运行")
+            return
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="选择 accounts 文件",
+            filetypes=[("Accounts", "accounts_*.txt"), ("Text", "*.txt"), ("All", "*.*")],
+            initialdir=os.path.dirname(__file__),
+        )
+        if not path:
+            return
+        use_browser = bool(self.nsfw_use_browser_var.get())
+        self.stop_requested = False
+        self._set_running_ui(True)
+        self.log(f"[*] 开始 NSFW 补开: {path} (浏览器={'开' if use_browser else '关/HTTP'})")
+        threading.Thread(
+            target=self.run_nsfw_backfill,
+            args=(path, use_browser),
+            daemon=True,
+        ).start()
+
+    def run_nsfw_backfill(self, path, use_browser=True):
+        from nsfw_backfill import backfill_nsfw_from_accounts, dry_run_validate_file
+        try:
+            preview = dry_run_validate_file(path)
+            self.log(
+                f"[*] 预检：有效账号={preview.parsed} 跳过行={preview.skipped} 总行={preview.total_lines}"
+            )
+            if preview.parsed <= 0:
+                self.log("[!] 文件中没有可处理的账号行（email----password----sso）")
+                return
+
+            browser_started = False
+            if use_browser:
+                try:
+                    self.call_on_ui_thread(
+                        lambda: start_browser(log_callback=self.log),
+                        timeout=180,
+                    )
+                    browser_started = True
+                    self.log("[*] 补开浏览器已启动（Web 路径）")
+                except Exception as exc:
+                    self.log(f"[!] 浏览器启动失败，回退 HTTP 补开: {exc}")
+
+            def enable(token, log_callback=None):
+                return enable_nsfw_for_token(token, log_callback=log_callback)
+
+            result = backfill_nsfw_from_accounts(
+                path,
+                enable_nsfw=enable,
+                log_callback=self.log,
+                cancel_callback=self.should_stop,
+                delay_sec=1.5,
+                sleep_fn=time.sleep,
+            )
+            self.log(
+                f"[*] 补开汇总：成功={result.success} 失败={result.failed} "
+                f"跳过={result.skipped} 取消={result.cancelled}"
+            )
+            if result.failures:
+                for email, err in result.failures[:20]:
+                    self.log(f"[Debug] 失败明细: {email}: {err}")
+            if browser_started:
+                try:
+                    self.call_on_ui_thread(lambda: stop_browser(), timeout=60)
+                except Exception as exc:
+                    self.log(f"[Debug] 关闭补开浏览器异常: {exc}")
+        except Exception as exc:
+            log_exception("NSFW 补开异常", exc, self.log)
+        finally:
+            self._set_running_ui(False)
+            self.log("[*] NSFW 补开任务结束")
 
     def run_registration(self, count):
         def observer(batch, account, output):
