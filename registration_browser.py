@@ -608,6 +608,20 @@ return candidates[0].text || true;
 
     raise Exception("未找到「使用邮箱注册」按钮")
 
+def _signup_proxy_max_attempts():
+    """代理失败时最多换几次节点再开注册页（不再静默直连）。"""
+    try:
+        from proxy_manager import pool_summary
+        size = int((pool_summary() or {}).get("size") or 0)
+    except Exception:
+        size = 0
+    if size > 0:
+        return max(1, min(size, 5))
+    if get_configured_proxy():
+        return 2
+    return 1
+
+
 def open_signup_page(log_callback=None, cancel_callback=None):
     global browser, page
     raise_if_cancelled(cancel_callback)
@@ -627,22 +641,40 @@ def open_signup_page(log_callback=None, cancel_callback=None):
             page = browser.new_tab(SIGNUP_URL)
         page.wait.doc_loaded()
 
-    try:
-        _open_with_current_browser()
-    except Exception as e:
-        if browser_started_with_proxy and get_configured_proxy():
-            if log_callback:
-                log_callback(f"[!] 浏览器代理访问注册页失败，自动回退直连: {e}")
-            restart_browser(log_callback=log_callback, use_proxy=False)
+    max_attempts = _signup_proxy_max_attempts()
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        raise_if_cancelled(cancel_callback)
+        try:
             _open_with_current_browser()
-        else:
-            raise
-
-    if browser_started_with_proxy and page_has_proxy_error(page):
-        if log_callback:
-            log_callback("[!] 浏览器页面显示代理错误，自动回退直连")
-        restart_browser(log_callback=log_callback, use_proxy=False)
-        _open_with_current_browser()
+            if browser_started_with_proxy and page_has_proxy_error(page):
+                raise RuntimeError("浏览器页面显示代理错误")
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            can_rotate = bool(browser_started_with_proxy and get_configured_proxy())
+            if not can_rotate or attempt >= max_attempts:
+                if can_rotate:
+                    raise RuntimeError(
+                        f"代理访问注册页失败，已换节点重试 {attempt}/{max_attempts} 次: {e}"
+                    ) from e
+                raise
+            if log_callback:
+                log_callback(
+                    f"[!] 浏览器代理访问注册页失败 ({attempt}/{max_attempts})，换节点重试: {e}"
+                )
+            try:
+                from proxy_manager import rotate_session
+                session_id = rotate_session(reason="signup-proxy-fail")
+                if log_callback and session_id:
+                    log_callback(f"[*] 代理会话已轮转 session={session_id[:8]}…")
+            except Exception as rotate_exc:
+                if log_callback:
+                    log_callback(f"[Debug] 换节点失败: {rotate_exc}")
+            restart_browser(log_callback=log_callback, use_proxy=True)
+    if last_error is not None:
+        raise last_error
 
     sleep_with_cancel(2, cancel_callback)
     if log_callback:
