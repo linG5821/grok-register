@@ -77,6 +77,84 @@ class AccountRetryNeeded(Exception):
     pass
 
 
+def _wait_for_ui_result(done, timeout=90, cancel_callback=None, poll=0.2):
+    """后台线程等待主线程 call 结果；支持超时与 cancel。"""
+    deadline = time.time() + float(timeout)
+    while True:
+        if cancel_callback is not None:
+            try:
+                if cancel_callback():
+                    raise RegistrationCancelled()
+            except RegistrationCancelled:
+                raise
+            except Exception:
+                pass
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise TimeoutError(f"主线程调用超时（{timeout}s）")
+        try:
+            kind, payload = done.get(timeout=min(float(poll), remaining))
+            break
+        except queue.Empty:
+            continue
+    if kind == "err":
+        raise payload
+    return payload
+
+
+def _retry_ui_browser_op(
+    name,
+    single_shot,
+    call_on_ui,
+    should_stop,
+    log=None,
+    max_attempts=3,
+    per_attempt_timeout=50,
+    sleep_fn=None,
+    cleanup_fn=None,
+):
+    """在 worker 线程外层重试「单次」主线程浏览器操作。
+
+    每次只把一次 start/restart 丢进主线程（max_attempts=1），失败后清理再试；
+    单次超时与重试间隔保持较短，避免 3×90s 级干等。
+    """
+    sleep_fn = sleep_fn or time.sleep
+    last_exc = None
+    attempts = max(1, int(max_attempts or 1))
+    for attempt in range(1, attempts + 1):
+        if should_stop and should_stop():
+            raise RegistrationCancelled()
+        try:
+            return call_on_ui(
+                single_shot,
+                timeout=per_attempt_timeout,
+                cancel_callback=should_stop,
+            )
+        except RegistrationCancelled:
+            if cleanup_fn:
+                try:
+                    cleanup_fn()
+                except Exception:
+                    pass
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if log:
+                log(f"[!] {name}失败 (第{attempt}/{attempts}次): {type(exc).__name__}: {exc}")
+            if cleanup_fn:
+                try:
+                    cleanup_fn()
+                except Exception as clean_exc:
+                    if log:
+                        log(f"[Debug] {name}失败后清理异常: {clean_exc}")
+            if attempt >= attempts:
+                break
+            if should_stop and should_stop():
+                raise RegistrationCancelled()
+            sleep_fn(min(1.0 * attempt, 2.5))
+    raise Exception(f"{name}失败，已重试{attempts}次: {last_exc}")
+
+
 
 
 class RemoteTokenCompatibilityError(RuntimeError):
@@ -278,7 +356,7 @@ def _bind_registration_browser():
 
 
 LocalAuthProxyBridge = _browser_runtime.LocalAuthProxyBridge
-for _name in ['get_configured_proxy', 'get_proxies', '_parse_proxy_url', '_safe_proxy_port', '_proxy_has_auth', '_strip_proxy_auth', '_proxy_endpoint_terms', 'is_proxy_connection_error', 'page_has_proxy_error', '_ReusableThreadingTCPServer', '_proxy_recv_until_headers', '_proxy_relay', '_LocalAuthProxyBridgeHandler', 'LocalAuthProxyBridge', 'prepare_browser_proxy', 'apply_browser_proxy_option', 'create_browser_options', '_build_request_kwargs', 'http_get', 'http_post', 'remote_import_http_get', 'remote_import_http_post', 'remote_import_use_proxy', 'mail_http_get', 'mail_http_post', 'mail_use_proxy']:
+for _name in ['get_configured_proxy', 'get_proxies', '_parse_proxy_url', '_safe_proxy_port', '_proxy_has_auth', '_strip_proxy_auth', '_proxy_endpoint_terms', 'is_proxy_connection_error', 'page_has_proxy_error', 'page_has_navigation_failure', '_ReusableThreadingTCPServer', '_proxy_recv_until_headers', '_proxy_relay', '_LocalAuthProxyBridgeHandler', 'LocalAuthProxyBridge', 'prepare_browser_proxy', 'apply_browser_proxy_option', 'create_browser_options', '_build_request_kwargs', 'http_get', 'http_post', 'remote_import_http_get', 'remote_import_http_post', 'remote_import_use_proxy', 'mail_http_get', 'mail_http_post', 'mail_use_proxy']:
     if _name.startswith("_") and _name in {"_ReusableThreadingTCPServer", "_LocalAuthProxyBridgeHandler", "_proxy_recv_until_headers", "_proxy_relay"}:
         continue
     if _name != "LocalAuthProxyBridge":
@@ -900,7 +978,12 @@ def run_registration_common(count, log_callback, cancel_callback, accounts_outpu
         start_browser=_start,
         restart_browser=_restart,
         browser_missing=lambda: _registration_browser.browser is None,
-        open_signup_page=lambda: open_signup_page(log_callback=log_callback, cancel_callback=cancel_callback),
+        open_signup_page=lambda: open_signup_page(
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            start_browser_fn=_start,
+            restart_browser_fn=_restart,
+        ),
         fill_email_and_submit=lambda: fill_email_and_submit(log_callback=log_callback, cancel_callback=cancel_callback),
         save_mail_credential=lambda email, token: _save_mail_credential(email, token, log_callback),
         fill_code_and_submit=lambda email, token: fill_code_and_submit(email, token, log_callback=log_callback, cancel_callback=cancel_callback),
@@ -1214,6 +1297,15 @@ class GrokRegisterGUI:
         self.log_text.grid(row=0, column=0, sticky=tk.NSEW)
         self.log("[*] GUI 已就绪，配置已加载")
         self.log(f"[*] 当前邮箱服务商: {self.email_provider_var.get()} | 注册数量: {self.count_var.get()}")
+        try:
+            from proxy_manager import proxy_health_should_run, start_background_scan
+            if proxy_health_should_run():
+                start_background_scan(log=self.log)
+                self.log("[*] 已启动后台代理 TCP 探活")
+            else:
+                self.log("[*] 未配置代理，跳过探活（直连模式）")
+        except Exception as exc:
+            self.log(f"[Debug] 启动代理探活失败: {exc}")
 
     def process_ui_queue(self):
         try:
@@ -1251,11 +1343,12 @@ class GrokRegisterGUI:
             except Exception:
                 pass
 
-    def call_on_ui_thread(self, func, timeout=180):
+    def call_on_ui_thread(self, func, timeout=90, cancel_callback=None):
         """把 func 调度到 Tk 主线程并等待结果。已在主线程则直接调用。
 
         注意：func 若长时间阻塞，仍会卡住 UI（process_ui_queue 同步执行 call）。
         仅用于 start/stop 浏览器等短操作；禁止把整段 enable_nsfw/网络循环放进来。
+        cancel_callback 为真时提前抛 RegistrationCancelled（主线程上的 func 仍可能继续跑完）。
         """
         if threading.current_thread() is threading.main_thread():
             return func()
@@ -1268,20 +1361,55 @@ class GrokRegisterGUI:
                 done.put(("err", exc))
 
         self.ui_queue.put(("call", runner))
-        # 等待期间让出 GIL；主线程 process_ui_queue 会跑 runner
-        deadline = time.time() + float(timeout)
-        while True:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                raise TimeoutError(f"主线程调用超时（{timeout}s）")
+        try:
+            return _wait_for_ui_result(
+                done,
+                timeout=timeout,
+                cancel_callback=cancel_callback or self.should_stop,
+            )
+        except (TimeoutError, RegistrationCancelled):
+            # 超时/停止后尽量清理，避免僵尸 Chrome 占端口导致无法再开
             try:
-                kind, payload = done.get(timeout=min(0.2, remaining))
-                break
-            except queue.Empty:
-                continue
-        if kind == "err":
-            raise payload
-        return payload
+                self.ui_queue.put(("call", lambda: stop_browser()))
+            except Exception:
+                pass
+            raise
+
+    def _force_stop_browser_best_effort(self):
+        """停止任务时尽力关浏览器；主线程可直接 stop，否则异步投递。"""
+        try:
+            if threading.current_thread() is threading.main_thread():
+                stop_browser()
+            else:
+                self.ui_queue.put(("call", lambda: stop_browser()))
+        except Exception as exc:
+            self.log(f"[Debug] 强制关闭浏览器异常: {exc}")
+
+    def _ui_start_browser(self):
+        return _retry_ui_browser_op(
+            name="启动浏览器",
+            single_shot=lambda: start_browser(log_callback=self.log, max_attempts=1),
+            call_on_ui=self.call_on_ui_thread,
+            should_stop=self.should_stop,
+            log=self.log,
+            max_attempts=3,
+            per_attempt_timeout=50,
+            sleep_fn=time.sleep,
+            cleanup_fn=self._force_stop_browser_best_effort,
+        )
+
+    def _ui_restart_browser(self):
+        return _retry_ui_browser_op(
+            name="重启浏览器",
+            single_shot=lambda: restart_browser(log_callback=self.log, max_attempts=1),
+            call_on_ui=self.call_on_ui_thread,
+            should_stop=self.should_stop,
+            log=self.log,
+            max_attempts=3,
+            per_attempt_timeout=55,
+            sleep_fn=time.sleep,
+            cleanup_fn=self._force_stop_browser_best_effort,
+        )
 
     def log(self, message):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
@@ -1366,6 +1494,13 @@ class GrokRegisterGUI:
         self._set_running_ui(True)
         self.log(f"[*] 配置已保存，开始执行。目标数量: {count}")
         self.log(f"[*] 成功账号将实时保存到: {self.accounts_output_file}")
+        # 配置变更后重启探活（pool 可能变）
+        try:
+            from proxy_manager import proxy_health_should_run, start_background_scan
+            if proxy_health_should_run():
+                start_background_scan(log=self.log)
+        except Exception:
+            pass
         threading.Thread(
             target=self.run_registration,
             args=(count,),
@@ -1375,6 +1510,8 @@ class GrokRegisterGUI:
     def stop_registration(self):
         self.stop_requested = True
         self.log("[!] 用户停止注册")
+        # 不立刻 _set_running_ui(False)：worker finally 会清；这里强制关浏览器打断卡住的启停
+        self._force_stop_browser_best_effort()
 
     def start_nsfw_backfill(self):
         if self.is_running:
@@ -1422,12 +1559,12 @@ class GrokRegisterGUI:
             browser_started = False
             if use_browser:
                 try:
-                    self.call_on_ui_thread(
-                        lambda: start_browser(log_callback=self.log),
-                        timeout=180,
-                    )
+                    self._ui_start_browser()
                     browser_started = True
                     self.log("[*] 补开浏览器已启动（Web；失败不回退 HTTP）")
+                except RegistrationCancelled:
+                    self.log("[!] 补开已取消")
+                    return
                 except Exception as exc:
                     self.log(f"[!] 浏览器启动失败: {exc}")
                     return
@@ -1462,11 +1599,20 @@ class GrokRegisterGUI:
                     self.log(f"[Debug] 失败明细: {email}: {err}")
             if browser_started:
                 try:
-                    self.call_on_ui_thread(lambda: stop_browser(), timeout=60)
+                    self.call_on_ui_thread(
+                        lambda: stop_browser(),
+                        timeout=30,
+                        cancel_callback=lambda: False,
+                    )
                 except Exception as exc:
                     self.log(f"[Debug] 关闭补开浏览器异常: {exc}")
+                    self._force_stop_browser_best_effort()
+        except RegistrationCancelled:
+            self.log("[!] NSFW 补开被停止")
+            self._force_stop_browser_best_effort()
         except Exception as exc:
             log_exception("NSFW 补开异常", exc, self.log)
+            self._force_stop_browser_best_effort()
         finally:
             self._set_running_ui(False)
             self.log("[*] NSFW 补开任务结束")
@@ -1481,27 +1627,52 @@ class GrokRegisterGUI:
                 self.results.append({"email": account.email, "sso": account.sso, "profile": account.profile, "output": output})
             self.update_stats()
         try:
+            from proxy_manager import (
+                proxy_health_should_run,
+                wait_until_available,
+                NoAvailableProxyError,
+                ProxyWaitCancelled,
+            )
+            if proxy_health_should_run():
+                try:
+                    from proxy_manager import acquire_healthy_proxy
+                    wait_until_available(
+                        cancel_callback=self.should_stop,
+                        log=self.log,
+                        poll=0.5,
+                    )
+                    # peek 之后立刻 acquire，避免 start_browser 仍用旧/死节点
+                    acquire_healthy_proxy(reason="batch-start")
+                    self.log("[*] 已选定健康代理，开始注册流程")
+                except ProxyWaitCancelled:
+                    self.log("[!] 等待可用代理时用户停止")
+                    return
+                except NoAvailableProxyError as exc:
+                    self.log(f"[!] {exc}，拒绝启动注册")
+                    return
+            else:
+                self.log("[*] 未配置代理，使用直连注册")
             batch = run_registration_common(
                 count=count,
                 log_callback=self.log,
                 cancel_callback=self.should_stop,
                 accounts_output_file=self.accounts_output_file,
                 observer=observer,
-                # Windows：Chromium 必须在 Tk 主线程启动，后台线程 + 代理会 CDP 失败
-                start_browser_fn=lambda: self.call_on_ui_thread(
-                    lambda: start_browser(log_callback=self.log), timeout=180
-                ),
-                restart_browser_fn=lambda: self.call_on_ui_thread(
-                    lambda: restart_browser(log_callback=self.log), timeout=180
-                ),
+                # Windows：Chromium 必须在 Tk 主线程启动；外层重试，主线程每次只试 1 次
+                start_browser_fn=self._ui_start_browser,
+                restart_browser_fn=self._ui_restart_browser,
             )
             self.success_count = batch.success_count
             self.fail_count = batch.fail_count
             self.registered_unsaved_count = batch.registered_unsaved_count
             self.postprocess_warning_count = batch.postprocess_warning_count
             self.update_stats()
+        except RegistrationCancelled:
+            self.log("[!] 注册被停止")
+            self._force_stop_browser_best_effort()
         except Exception as exc:
             log_exception("任务异常", exc, self.log)
+            self._force_stop_browser_best_effort()
         finally:
             self._set_running_ui(False)
             self.log("[*] 任务结束")

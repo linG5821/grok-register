@@ -122,6 +122,59 @@ def page_has_proxy_error(page_obj):
     ))
 
 
+def page_has_navigation_failure(page_obj):
+    """Chrome 错误页 / 代理失败 / 无法访问（含中英文）。"""
+    if page_has_proxy_error(page_obj):
+        return True
+    try:
+        url = str(getattr(page_obj, "url", "") or "")
+        title = ""
+        body = ""
+        try:
+            title = str(page_obj.run_js("return document.title || ''") or "")
+        except Exception:
+            pass
+        try:
+            body = str(
+                page_obj.run_js(
+                    "return document.body ? document.body.innerText.slice(0, 2500) : ''"
+                )
+                or ""
+            )
+        except Exception:
+            pass
+        try:
+            html = str(getattr(page_obj, "html", "") or "")[:2500]
+        except Exception:
+            html = ""
+    except Exception:
+        return False
+    text = "%s\n%s\n%s\n%s" % (url, title, body, html)
+    text_l = text.lower()
+    markers = (
+        "无法访问此网站",
+        "无法访问",
+        "网页无法打开",
+        "连接已重置",
+        "dns_probe",
+        "err_connection",
+        "err_name_not_resolved",
+        "err_timed_out",
+        "err_tunnel",
+        "err_proxy",
+        "err_empty_response",
+        "err_ssl",
+        "err_address_unreachable",
+        "this site can't be reached",
+        "this site can’t be reached",
+        "took too long to respond",
+        "dns_probe_finished",
+        "chrome-error://",
+        "about:neterror",
+    )
+    return any(m in text_l or m in text for m in markers)
+
+
 def prepare_browser_proxy(use_proxy=True, log_callback=None):
     proxy = get_configured_proxy()
     if not use_proxy or not proxy:
@@ -185,12 +238,13 @@ def create_browser_options(browser_proxy="", extension_path=None):
     options = ChromiumOptions()
     options.auto_port()
     try:
-        options.set_timeouts(base=15, page_load=60, script=30)
+        # page_load 与注册开页 28s 对齐；过长会拖死卡住的导航
+        options.set_timeouts(base=10, page_load=35, script=20)
     except TypeError:
-        options.set_timeouts(base=15)
+        options.set_timeouts(base=10)
     try:
         if hasattr(options, "set_retry"):
-            options.set_retry(times=5, interval=1)
+            options.set_retry(times=2, interval=0.5)
     except Exception:
         pass
     apply_browser_proxy_option(options, browser_proxy)

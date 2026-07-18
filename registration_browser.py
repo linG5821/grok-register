@@ -5,6 +5,7 @@ import random
 import re
 import secrets
 import struct
+import threading
 import time
 
 from DrissionPage import Chromium
@@ -530,14 +531,18 @@ def stop_browser_proxy_bridge():
     browser_proxy_bridge = None
 
 def _configure_drission_connect_timeouts():
-    """Windows 冷启动 Chrome 常 >30s；默认 browser_connect_timeout=30 会导致首次失败。"""
+    """CDP 连接超时：够用即可，过大只会让失败路径干等。
+
+    成功时一旦连上就返回，超时只影响挂死/失败。默认 45s 覆盖多数 Win 冷启动；
+    失败后由外层短重试，而不是单次 90s 干等。
+    """
     try:
         from DrissionPage._functions.settings import Settings as _Settings
-        # 首次启动（杀软扫盘/写 user-data）在 Win 上经常 20–50s
-        if getattr(_Settings, "browser_connect_timeout", 30) < 90:
-            _Settings.set_browser_connect_timeout(90)
-        if getattr(_Settings, "cdp_timeout", 30) < 60:
-            _Settings.set_cdp_timeout(60)
+        # 固定设为较快上限，避免被旧值 90 一直抬高
+        if hasattr(_Settings, "set_browser_connect_timeout"):
+            _Settings.set_browser_connect_timeout(45)
+        if hasattr(_Settings, "set_cdp_timeout"):
+            _Settings.set_cdp_timeout(30)
     except Exception:
         pass
 
@@ -554,34 +559,95 @@ def _cleanup_orphaned_debug_browser(options, log_callback=None):
         if hasattr(orphan_opts, "existing_only"):
             orphan_opts.existing_only()
         orphan = Chromium(orphan_opts)
-        try:
-            orphan.quit(timeout=3, force=True, del_data=True)
-        except TypeError:
-            try:
-                orphan.quit(del_data=True)
-            except Exception:
-                pass
+        _quit_browser_instance(orphan, timeout=3, force=True, del_data=True)
         if log_callback:
             log_callback(f"[Debug] 已清理失败启动残留浏览器: {address}")
     except Exception:
         pass
 
 
-def start_browser(log_callback=None, use_proxy=True):
+def _quit_browser_instance(target, timeout=3, force=True, del_data=True):
+    """短超时关闭浏览器，避免 Windows 上 quit 卡死主线程。"""
+    if target is None:
+        return
+    try:
+        target.quit(timeout=timeout, force=force, del_data=del_data)
+        return
+    except TypeError:
+        pass
+    except Exception:
+        pass
+    try:
+        target.quit(del_data=del_data)
+    except Exception:
+        pass
+
+
+def start_browser(log_callback=None, use_proxy=True, max_attempts=4):
+    """启动 Chromium。
+
+    max_attempts: 本函数内重试次数。GUI 主线程路径应传 1，由外层 worker 重试，
+    避免单次 call_on_ui_thread(180s) 包不住 4×90s 导致僵尸启动。
+    """
     global browser, page, browser_proxy_bridge, browser_started_with_proxy
     _configure_drission_connect_timeouts()
     last_exc = None
+    attempts = max(1, int(max_attempts or 1))
     proxy_enabled = bool(use_proxy and get_configured_proxy())
-    for attempt in range(1, 5):
+    for attempt in range(1, attempts + 1):
         bridge = None
         options = None
         try:
+            if use_proxy:
+                try:
+                    from proxy_manager import (
+                        probe_proxy_usable,
+                        rotate_session,
+                        mark_proxy_dead,
+                        acquire_healthy_proxy,
+                        proxy_health_should_run,
+                        NoAvailableProxyError,
+                    )
+                    configured = get_configured_proxy()
+                    # TCP + 经代理访问 Grok 域名，避免“端口通但上不了 x.ai”
+                    if configured and not probe_proxy_usable(configured):
+                        if log_callback:
+                            log_callback(
+                                f"[!] 代理探活失败(TCP/Grok)，跳过本节点 "
+                                f"(第{attempt}/{attempts}次): {configured}"
+                            )
+                        try:
+                            mark_proxy_dead(configured, reason="browser-preflight-fail")
+                        except Exception:
+                            pass
+                        try:
+                            if proxy_health_should_run():
+                                acquire_healthy_proxy(
+                                    reason="browser-preflight-fail", wait_sec=0
+                                )
+                            else:
+                                rotate_session(reason="proxy-preflight-fail")
+                        except NoAvailableProxyError:
+                            raise RuntimeError("代理探活失败且无可用节点") from None
+                        except Exception:
+                            try:
+                                rotate_session(reason="proxy-preflight-fail")
+                            except Exception:
+                                pass
+                        raise RuntimeError("代理探活失败，节点不可达")
+                except RuntimeError:
+                    raise
+                except Exception as probe_exc:
+                    if log_callback:
+                        log_callback(f"[Debug] 代理探活异常，继续启动: {probe_exc}")
             browser_proxy, bridge = prepare_browser_proxy(use_proxy=use_proxy, log_callback=log_callback)
             if log_callback:
                 if browser_proxy:
-                    log_callback(f"[*] 正在启动 Chromium（代理 {browser_proxy}，第 {attempt}/4 次）…")
+                    log_callback(
+                        f"[*] 正在启动 Chromium（代理 {browser_proxy}，第 {attempt}/{attempts} 次）…"
+                    )
                 else:
-                    log_callback(f"[*] 正在启动 Chromium（直连，第 {attempt}/4 次）…")
+                    log_callback(f"[*] 正在启动 Chromium（直连，第 {attempt}/{attempts} 次）…")
             options = create_browser_options(browser_proxy=browser_proxy)
             # 干净 user-data，减少上次崩溃锁文件导致的首次连不上
             try:
@@ -591,7 +657,8 @@ def start_browser(log_callback=None, use_proxy=True):
                 pass
             try:
                 if hasattr(options, "set_retry"):
-                    options.set_retry(times=5, interval=1)
+                    # 少重试、短间隔：连不上尽快失败换节点/外层重试
+                    options.set_retry(times=2, interval=0.5)
             except Exception:
                 pass
             if log_callback:
@@ -600,9 +667,6 @@ def start_browser(log_callback=None, use_proxy=True):
                     log_callback(
                         f"[Debug] proxy_args={[a for a in args if 'proxy' in str(a).lower()]}"
                     )
-                    addr = getattr(options, "address", None)
-                    if addr:
-                        log_callback(f"[Debug] CDP address={addr}")
                     # 若环境变量仍带代理，Chrome 会继承并搞挂 CDP（脚本不过 env 所以能过）
                     env_proxy = {
                         k: os.environ.get(k)
@@ -634,20 +698,20 @@ def start_browser(log_callback=None, use_proxy=True):
             browser_started_with_proxy = bool(browser_proxy)
             if log_callback:
                 log_callback("[*] Chromium 已连接，正在获取标签页…")
-            # get_tabs 偶发在刚连上时为空/抛错，短重试
+            # get_tabs 偶发在刚连上时为空/抛错，短重试（总等待约 <1s）
             page = None
-            for tab_try in range(5):
+            for tab_try in range(3):
                 try:
                     tabs = browser.get_tabs()
                     page = tabs[-1] if tabs else browser.new_tab()
                     if page is not None:
                         break
                 except Exception as tab_exc:
-                    if tab_try >= 4:
+                    if tab_try >= 2:
                         raise
                     if log_callback and tab_try == 0:
                         log_callback(f"[Debug] 获取标签页重试: {tab_exc}")
-                    time.sleep(0.4 * (tab_try + 1))
+                    time.sleep(0.2 * (tab_try + 1))
             if log_callback and getattr(browser, "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
             if log_callback and get_configured_proxy():
@@ -665,10 +729,13 @@ def start_browser(log_callback=None, use_proxy=True):
                     pass
             if log_callback:
                 mode = "代理" if proxy_enabled else "直连"
-                log_callback(f"[Debug] 浏览器{mode}启动失败(第{attempt}/4次): {type(exc).__name__}: {exc}")
+                log_callback(
+                    f"[Debug] 浏览器{mode}启动失败(第{attempt}/{attempts}次): "
+                    f"{type(exc).__name__}: {exc}"
+                )
             try:
                 if browser is not None:
-                    browser.quit(del_data=True)
+                    _quit_browser_instance(browser, timeout=3, force=True, del_data=True)
             except Exception:
                 pass
             # Chromium() 构造失败时 browser 仍是 None，但系统里可能已有半拉子 Chrome
@@ -678,25 +745,25 @@ def start_browser(log_callback=None, use_proxy=True):
             page = None
             browser_proxy_bridge = None
             browser_started_with_proxy = False
-            # 首次失败多等一会：给杀软/磁盘释放时间，也避免立刻撞残留进程
-            time.sleep(min(2.0 * attempt, 6))
-    raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
+            # 失败后短歇再试，避免长时间空等
+            if attempt < attempts:
+                time.sleep(min(1.0 * attempt, 2.5))
+    raise Exception(f"浏览器启动失败，已重试{attempts}次: {last_exc}")
 
 def stop_browser():
     global browser, page, browser_started_with_proxy
     if browser is not None:
-        try:
-            browser.quit(del_data=True)
-        except Exception:
-            pass
+        _quit_browser_instance(browser, timeout=5, force=True, del_data=True)
     stop_browser_proxy_bridge()
     browser = None
     page = None
     browser_started_with_proxy = False
 
-def restart_browser(log_callback=None, use_proxy=True):
+def restart_browser(log_callback=None, use_proxy=True, max_attempts=4):
     stop_browser()
-    return start_browser(log_callback=log_callback, use_proxy=use_proxy)
+    return start_browser(
+        log_callback=log_callback, use_proxy=use_proxy, max_attempts=max_attempts
+    )
 
 def cleanup_runtime_memory(log_callback=None, reason="定期清理"):
     if log_callback:
@@ -793,38 +860,146 @@ return candidates[0].text || true;
 
     raise Exception("未找到「使用邮箱注册」按钮")
 
+def _signup_page_load_timeout():
+    try:
+        from app_config import config as _cfg
+        return max(10, int(_cfg.get("signup_page_load_timeout", 28) or 28))
+    except Exception:
+        return 28
+
+
 def _signup_proxy_max_attempts():
-    """代理失败时最多换几次节点再开注册页（不再静默直连）。"""
+    """单账号开页换节点安全阀：min(pool, 30)；无池但有 proxy 为 2；直连 1。"""
     try:
         from proxy_manager import pool_summary
         size = int((pool_summary() or {}).get("size") or 0)
     except Exception:
         size = 0
     if size > 0:
-        return max(1, min(size, 5))
+        return max(1, min(size, 30))
     if get_configured_proxy():
         return 2
     return 1
 
 
-def open_signup_page(log_callback=None, cancel_callback=None):
+def _page_shows_nav_failure(page_obj):
+    try:
+        if page_has_navigation_failure(page_obj):
+            return True
+    except NameError:
+        pass
+    except Exception:
+        pass
+    try:
+        return bool(page_has_proxy_error(page_obj))
+    except Exception:
+        return False
+
+
+def _signup_page_ok(page_obj):
+    if page_obj is None:
+        return False
+    if _page_shows_nav_failure(page_obj):
+        return False
+    try:
+        url = str(getattr(page_obj, "url", "") or "").lower()
+    except Exception:
+        url = ""
+    if "chrome-error://" in url or "chromewebdata" in url:
+        return False
+    return ("accounts.x.ai" in url) or ("x.ai" in url and "sign" in url)
+
+
+def open_signup_page(
+    log_callback=None,
+    cancel_callback=None,
+    start_browser_fn=None,
+    restart_browser_fn=None,
+):
+    """打开注册页；代理失败/超时则换节点重启（可注入 GUI 主线程 start/restart）。"""
     global browser, page
     raise_if_cancelled(cancel_callback)
+    _start = start_browser_fn or (
+        lambda: start_browser(log_callback=log_callback)
+    )
+    _restart = restart_browser_fn or (
+        lambda: restart_browser(log_callback=log_callback, use_proxy=True)
+    )
     if browser is None:
-        start_browser(log_callback=log_callback)
+        _start()
         if log_callback:
             log_callback("[*] 浏览器已启动")
 
+    load_timeout = _signup_page_load_timeout()
+
+    def _navigate_signup(the_page):
+        """打开注册 URL；带 timeout，旧 API 用墙钟线程保护，禁止无限阻塞。"""
+        try:
+            the_page.get(SIGNUP_URL, timeout=load_timeout)
+            return
+        except TypeError:
+            pass
+        except Exception as exc:
+            raise RuntimeError(f"打开注册页失败: {exc}") from exc
+
+        # 旧 DrissionPage 无 timeout：后台 get + 墙钟
+        err = {"e": None}
+
+        def _get():
+            try:
+                the_page.get(SIGNUP_URL)
+            except Exception as e:
+                err["e"] = e
+
+        t = threading.Thread(target=_get, daemon=True)
+        t.start()
+        t.join(float(load_timeout) + 2.0)
+        if t.is_alive():
+            raise RuntimeError(f"打开注册页超时({load_timeout}s)")
+        if err["e"] is not None:
+            raise RuntimeError(f"打开注册页失败: {err['e']}") from err["e"]
+
     def _open_with_current_browser():
         global page
+        deadline = time.time() + float(load_timeout)
         try:
             page = browser.get_tab(0)
-            page.get(SIGNUP_URL)
+            _navigate_signup(page)
         except Exception as e:
             if log_callback:
                 log_callback(f"[Debug] 打开URL异常: {e}")
-            page = browser.new_tab(SIGNUP_URL)
-        page.wait.doc_loaded()
+            try:
+                page = browser.new_tab()
+                _navigate_signup(page)
+            except Exception as e2:
+                raise RuntimeError(f"打开注册页失败: {e2}") from e2
+        # 优先带 timeout；旧 API 无 timeout 时用墙钟轮询，禁止无限 doc_loaded()
+        try:
+            page.wait.doc_loaded(timeout=load_timeout)
+        except TypeError:
+            while time.time() < deadline:
+                try:
+                    ready = page.run_js(
+                        "return document.readyState === 'complete' || document.readyState === 'interactive'"
+                    )
+                    if ready:
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.3)
+            else:
+                raise RuntimeError(f"注册页加载超时({load_timeout}s)")
+        except Exception as wait_exc:
+            raise RuntimeError(
+                f"注册页加载超时/失败({load_timeout}s): {wait_exc}"
+            ) from wait_exc
+        if _page_shows_nav_failure(page):
+            raise RuntimeError("浏览器页面显示无法访问/代理错误")
+        if not _signup_page_ok(page):
+            # 未到 accounts 且非明确错误页时，仍可能是空白/卡住
+            url = str(getattr(page, "url", "") or "")
+            if not url or url.startswith("chrome") or url == "about:blank":
+                raise RuntimeError(f"注册页未正确打开: url={url!r}")
 
     max_attempts = _signup_proxy_max_attempts()
     last_error = None
@@ -832,8 +1007,6 @@ def open_signup_page(log_callback=None, cancel_callback=None):
         raise_if_cancelled(cancel_callback)
         try:
             _open_with_current_browser()
-            if browser_started_with_proxy and page_has_proxy_error(page):
-                raise RuntimeError("浏览器页面显示代理错误")
             last_error = None
             break
         except Exception as e:
@@ -850,14 +1023,42 @@ def open_signup_page(log_callback=None, cancel_callback=None):
                     f"[!] 浏览器代理访问注册页失败 ({attempt}/{max_attempts})，换节点重试: {e}"
                 )
             try:
-                from proxy_manager import rotate_session
-                session_id = rotate_session(reason="signup-proxy-fail")
-                if log_callback and session_id:
-                    log_callback(f"[*] 代理会话已轮转 session={session_id[:8]}…")
+                from proxy_manager import (
+                    mark_proxy_dead,
+                    rotate_session,
+                    NoAvailableProxyError,
+                    acquire_healthy_proxy,
+                    proxy_health_should_run,
+                )
+                mark_proxy_dead(reason="signup-page-fail")
+                if proxy_health_should_run():
+                    try:
+                        # 仍在扫时短等，避免 available 暂时为空就停任务
+                        acquire_healthy_proxy(
+                            reason="signup-proxy-fail",
+                            wait_sec=15,
+                            cancel_callback=cancel_callback,
+                        )
+                    except NoAvailableProxyError:
+                        # 原样抛出，供 flow 停任务；勿包成 RuntimeError
+                        raise
+                else:
+                    session_id = rotate_session(reason="signup-proxy-fail")
+                    if log_callback and session_id:
+                        log_callback(f"[*] 代理会话已轮转 session={session_id[:8]}…")
+            except NoAvailableProxyError:
+                raise
+            except RuntimeError:
+                raise
             except Exception as rotate_exc:
                 if log_callback:
                     log_callback(f"[Debug] 换节点失败: {rotate_exc}")
-            restart_browser(log_callback=log_callback, use_proxy=True)
+                try:
+                    from proxy_manager import rotate_session
+                    rotate_session(reason="signup-proxy-fail-fallback")
+                except Exception:
+                    pass
+            _restart()
     if last_error is not None:
         raise last_error
 

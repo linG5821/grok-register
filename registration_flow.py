@@ -7,11 +7,14 @@ try:
         rotate_session as _rotate_proxy_session,
         is_placeholder_configured as _proxy_uses_placeholder,
         diagnose_egress as _diagnose_egress,
+        NoAvailableProxyError as _NoAvailableProxyError,
     )
 except Exception:
     _rotate_proxy_session = None
     _proxy_uses_placeholder = lambda: False
     _diagnose_egress = None
+    class _NoAvailableProxyError(Exception):
+        pass
 
 
 @dataclass
@@ -244,6 +247,10 @@ def _prepare_next_account(result, settings, callbacks, ops):
         result.cancelled = True
         callbacks.log("[!] 已在账号间准备阶段停止")
         return False
+    except _NoAvailableProxyError as exc:
+        result.cancelled = True
+        callbacks.log(f"[!] 账号间准备时无可用代理，停止: {exc}")
+        return False
 
 
 def _rotate_proxy_for_new_account(callbacks):
@@ -355,6 +362,10 @@ def run_batch(count, callbacks, observer, ops, enable_nsfw=True, cleanup_interva
                 result.cancelled = True
                 callbacks.log("[!] 注册被停止")
                 continue_batch = False
+            except _NoAvailableProxyError as exc:
+                result.cancelled = True
+                continue_batch = False
+                callbacks.log(f"[!] 无可用代理，停止注册: {exc}")
             except ops.retry_exception as exc:
                 retry_count_for_slot += 1
                 if retry_count_for_slot <= settings.max_slot_retry:

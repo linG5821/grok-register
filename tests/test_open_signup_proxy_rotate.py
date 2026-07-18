@@ -17,7 +17,7 @@ class DummyPage:
         self.html = "proxy error" if proxy_error else "ok"
         self.wait = _Wait()
 
-    def get(self, url):
+    def get(self, url, timeout=None, **kwargs):
         self.url = url
 
 
@@ -68,8 +68,10 @@ class OpenSignupProxyRotateTests(unittest.TestCase):
                 patch.object(rb, "click_email_signup_button"), \
                 patch.object(rb, "get_configured_proxy", create=True, return_value="http://p"), \
                 patch.object(rb, "page_has_proxy_error", create=True, side_effect=lambda p: bool(p._proxy_error)), \
+                patch.object(rb, "page_has_navigation_failure", create=True, side_effect=lambda p: bool(p._proxy_error)), \
                 patch.object(rb, "_signup_proxy_max_attempts", return_value=3), \
                 patch.object(rb, "restart_browser", side_effect=restart), \
+                patch("proxy_manager.proxy_health_should_run", return_value=False), \
                 patch("proxy_manager.rotate_session", return_value="sess12345678") as rot:
             rb.open_signup_page(log_callback=logs.append)
 
@@ -98,8 +100,10 @@ class OpenSignupProxyRotateTests(unittest.TestCase):
                 patch.object(rb, "click_email_signup_button"), \
                 patch.object(rb, "get_configured_proxy", create=True, return_value="http://p"), \
                 patch.object(rb, "page_has_proxy_error", create=True, return_value=True), \
+                patch.object(rb, "page_has_navigation_failure", create=True, return_value=True), \
                 patch.object(rb, "_signup_proxy_max_attempts", return_value=2), \
                 patch.object(rb, "restart_browser", side_effect=restart), \
+                patch("proxy_manager.proxy_health_should_run", return_value=False), \
                 patch("proxy_manager.rotate_session", return_value="sess12345678"):
             with self.assertRaises(RuntimeError) as ctx:
                 rb.open_signup_page(log_callback=logs.append)
