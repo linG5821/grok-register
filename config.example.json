@@ -50,5 +50,22 @@
   "yyds_jwt": "",
   "cpa_oidc_request_timeout_sec": 15,
   "cpa_oidc_poll_timeout_sec": 15,
-  "grok2api_allow_legacy_full_save": false
+  "grok2api_allow_legacy_full_save": false,
+  "chenyme_grok2api_enabled": false,
+  "chenyme_grok2api_base": "",
+  "chenyme_grok2api_username": "",
+  "chenyme_grok2api_password": "",
+  "chenyme_grok2api_convert": true,
+  "chenyme_grok2api_convert_strategy": "missing",
+  "build_liveness_enabled": true,
+  "build_liveness_model": "grok-4.5",
+  "build_liveness_prompt": "hi",
+  "build_liveness_timeout_sec": 60,
+  "build_liveness_base_url": "",
+  "build_liveness_client_version": "",
+  "build_liveness_user_agent": "",
+  "build_liveness_client_identifier": "",
+  "build_liveness_token_auth": "",
+  "build_liveness_fetch_cli_from_chenyme": true,
+  "build_liveness_cli_cache_ttl_sec": 3600
 }

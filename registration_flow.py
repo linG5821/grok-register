@@ -101,6 +101,11 @@ def register_one_account(callbacks, ops, enable_nsfw=True, max_mail_retry=3):
         email, dev_token = ops.fill_email_and_submit()
         callbacks.log(f"[*] 邮箱: {email}")
         callbacks.log(f"[Debug] 邮箱credential(jwt): {dev_token}")
+        try:
+            from proxy_manager import remember_proxy_for_account
+            remember_proxy_for_account(email)
+        except Exception:
+            pass
         if not ops.save_mail_credential(email, dev_token):
             callbacks.log("[!] 邮箱凭据保存失败，注册继续，但已明确记录该异常")
         callbacks.log("[*] 3. 拉取验证码")

@@ -62,6 +62,10 @@ _scan_thread: threading.Thread | None = None
 _health_logger = None
 _DEAD_COOLDOWN_SEC = 60.0
 
+# 账号级代理绑定：后处理真活探测需用注册时出口，而非 rotate 后的节点
+_account_proxy_lock = threading.RLock()
+_account_proxy_by_email: dict[str, str] = {}
+
 
 class NoAvailableProxyError(RuntimeError):
     """已配置代理但当前无可用节点（全池探完仍空，或单代理探活失败）。"""
@@ -262,6 +266,39 @@ def expand_proxy(raw: str) -> str:
 
 def last_expanded_proxy() -> str:
     return _last_expanded
+
+
+def remember_proxy_for_account(email: str, proxy_url: str = "") -> str:
+    """记录某邮箱注册时使用的展开代理 URL；空 proxy_url 时取 last_expanded/当前池。"""
+    key = str(email or "").strip().lower()
+    if not key:
+        return ""
+    raw = str(proxy_url or "").strip()
+    if not raw:
+        raw = str(_last_expanded or "").strip()
+    if not raw:
+        try:
+            raw = str(expand_proxy(_load_config().get("proxy", "") or "") or "").strip()
+        except Exception:
+            raw = ""
+    with _account_proxy_lock:
+        if raw:
+            _account_proxy_by_email[key] = raw
+        return _account_proxy_by_email.get(key, "")
+
+
+def get_proxy_for_account(email: str) -> str:
+    """优先返回账号绑定代理，否则 last_expanded。"""
+    key = str(email or "").strip().lower()
+    with _account_proxy_lock:
+        if key and key in _account_proxy_by_email:
+            return _account_proxy_by_email[key]
+    return str(_last_expanded or "").strip()
+
+
+def clear_account_proxy_bindings():
+    with _account_proxy_lock:
+        _account_proxy_by_email.clear()
 
 
 _PROXY_ENV_KEYS = (

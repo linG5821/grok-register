@@ -884,7 +884,21 @@ def add_token_to_chenyme_grok2api(raw_token, email="", log_callback=None):
             return False
         if config.get("chenyme_grok2api_convert", True):
             chenyme_convert_to_build(log_callback=log_callback)
-        chenyme_check_bot_flag(email=email, log_callback=log_callback)
+        accounts = None
+        try:
+            accounts = chenyme_export_accounts(log_callback=log_callback)
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] chenyme export 失败，bot_flag/真活将各自重试: {exc}")
+            accounts = None
+        bot_flag = chenyme_check_bot_flag(email=email, log_callback=log_callback, accounts=accounts)
+        if config.get("build_liveness_enabled", True):
+            chenyme_probe_build_liveness(
+                email=email,
+                log_callback=log_callback,
+                accounts=accounts,
+                bot_flag=bot_flag,
+            )
         return True
     except Exception as exc:
         if log_callback:
@@ -908,7 +922,56 @@ def _decode_jwt_payload(token):
         return {}
 
 
-def chenyme_check_bot_flag(email="", log_callback=None):
+def chenyme_export_accounts(log_callback=None):
+    """拉 chenyme 账号 export 列表；失败返回 []。"""
+    base = _chenyme_normalize_base(config.get("chenyme_grok2api_base", ""))
+    if not base:
+        return []
+    access_token = chenyme_get_access_token(log_callback=log_callback)
+    endpoint = f"{base}/api/admin/v1/accounts/export"
+    resp = remote_import_http_get(
+        endpoint,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=30,
+    )
+    if resp.status_code == 401:
+        chenyme_clear_token_cache()
+        access_token = chenyme_get_access_token(log_callback=log_callback, force_refresh=True)
+        resp = remote_import_http_get(
+            endpoint,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=30,
+        )
+    resp.raise_for_status()
+    payload = resp.json() if hasattr(resp, "json") else {}
+    accounts = []
+    if isinstance(payload, dict):
+        accounts = payload.get("accounts") or []
+    return accounts if isinstance(accounts, list) else []
+
+
+def chenyme_find_build_account(email="", accounts=None, log_callback=None):
+    """在 export 结果中按 email 找 provider=grok_build 账号。"""
+    email = str(email or "").strip().lower()
+    if not email:
+        return None
+    items = accounts
+    if items is None:
+        try:
+            items = chenyme_export_accounts(log_callback=log_callback)
+        except Exception:
+            return None
+    for account in items or []:
+        if not isinstance(account, dict):
+            continue
+        if account.get("provider") != "grok_build":
+            continue
+        if str(account.get("name", "") or "").strip().lower() == email:
+            return account
+    return None
+
+
+def chenyme_check_bot_flag(email="", log_callback=None, accounts=None):
     """转换完成后拉一次账号导出，解 JWT 检查 bot_flag_source。
 
     该字段是 xAI 反滥用系统的账号级标记；一旦出现，所有 /v1/* 端点会
@@ -922,36 +985,11 @@ def chenyme_check_bot_flag(email="", log_callback=None):
     if not base:
         return None
     try:
-        access_token = chenyme_get_access_token(log_callback=log_callback)
-        endpoint = f"{base}/api/admin/v1/accounts/export"
-        resp = remote_import_http_get(
-            endpoint,
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout=30,
-        )
-        if resp.status_code == 401:
-            chenyme_clear_token_cache()
-            access_token = chenyme_get_access_token(log_callback=log_callback, force_refresh=True)
-            resp = remote_import_http_get(
-                endpoint,
-                headers={"Authorization": f"Bearer {access_token}"},
-                timeout=30,
-            )
-        resp.raise_for_status()
-        payload = resp.json() if hasattr(resp, "json") else {}
-        accounts = []
-        if isinstance(payload, dict):
-            accounts = payload.get("accounts") or []
-        target = None
-        for account in accounts:
-            if not isinstance(account, dict):
-                continue
-            if account.get("provider") != "grok_build":
-                continue
-            if str(account.get("name", "") or "").strip().lower() == email:
-                target = account
-                break
+        target = chenyme_find_build_account(email=email, accounts=accounts, log_callback=log_callback)
         if not target:
+            if accounts is None:
+                # 未传入列表时 find 已 export；仍没有
+                pass
             if log_callback:
                 log_callback(f"[Debug] 未在 chenyme 中找到 Build 账号 {email}，跳过 bot_flag 检查")
             return None
@@ -968,9 +1006,98 @@ def chenyme_check_bot_flag(email="", log_callback=None):
         return None
 
 
+def chenyme_fetch_settings_payload(log_callback=None):
+    """GET /api/admin/v1/settings，供 Build CLI recommended 版本。"""
+    base = _chenyme_normalize_base(config.get("chenyme_grok2api_base", ""))
+    if not base:
+        return None
+    access_token = chenyme_get_access_token(log_callback=log_callback)
+    endpoint = f"{base}/api/admin/v1/settings"
+    resp = remote_import_http_get(
+        endpoint,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=20,
+    )
+    if resp.status_code == 401:
+        chenyme_clear_token_cache()
+        access_token = chenyme_get_access_token(log_callback=log_callback, force_refresh=True)
+        resp = remote_import_http_get(
+            endpoint,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=20,
+        )
+    resp.raise_for_status()
+    payload = resp.json() if hasattr(resp, "json") else {}
+    return payload if isinstance(payload, dict) else None
+
+
+def chenyme_probe_build_liveness(email="", log_callback=None, accounts=None, bot_flag=None):
+    """convert 后真活：Build token + 注册代理 POST /responses。"""
+    if not config.get("build_liveness_enabled", True):
+        return {"ok": False, "skipped": True, "status": "skipped", "error": "disabled"}
+    email = str(email or "").strip().lower()
+    if not email:
+        return {"ok": False, "skipped": True, "status": "skipped", "error": "no_email"}
+    try:
+        import build_liveness as bl
+        from proxy_manager import get_proxy_for_account, remember_proxy_for_account
+
+        try:
+            remember_proxy_for_account(email)
+        except Exception:
+            pass
+        proxy = ""
+        try:
+            proxy = get_proxy_for_account(email)
+        except Exception:
+            proxy = ""
+        if not proxy:
+            try:
+                proxy = str(get_configured_proxy() or "").strip()
+            except Exception:
+                proxy = ""
+
+        profile = bl.get_cached_cli_profile(
+            config,
+            fetch_settings=(
+                (lambda: chenyme_fetch_settings_payload(log_callback=log_callback))
+                if config.get("build_liveness_fetch_cli_from_chenyme", True)
+                else None
+            ),
+        )
+        target = chenyme_find_build_account(email=email, accounts=accounts, log_callback=log_callback)
+        access = ""
+        flag = bot_flag
+        if target:
+            access = str(target.get("access_token") or "").strip()
+            if flag is None:
+                flag = _decode_jwt_payload(access).get("bot_flag_source")
+        result = bl.probe_build_responses(
+            access,
+            proxy=proxy,
+            config=config,
+            profile=profile,
+            email=email,
+            bot_flag=flag,
+            http_post=http_post,
+            log_callback=log_callback,
+        )
+        result["skipped"] = False
+        return result
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] Build 真活探测异常，已忽略: {exc}")
+        return {"ok": False, "skipped": False, "status": "error", "error": str(exc)[:300]}
+
+
 def run_registration_common(count, log_callback, cancel_callback, accounts_output_file, observer,
                             start_browser_fn=None, restart_browser_fn=None):
     from registration_flow import RegistrationCallbacks, RegistrationOperations, run_batch
+    try:
+        import build_liveness as bl
+        bl.set_liveness_output_path(bl.liveness_path_for_accounts(accounts_output_file))
+    except Exception:
+        pass
     callbacks = RegistrationCallbacks(log=log_callback, cancelled=cancel_callback)
     _start = start_browser_fn or (lambda: start_browser(log_callback=log_callback))
     _restart = restart_browser_fn or (lambda: restart_browser(log_callback=log_callback))

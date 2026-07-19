@@ -61,6 +61,17 @@ DEFAULT_CONFIG = {
     "chenyme_grok2api_password": "",
     "chenyme_grok2api_convert": True,
     "chenyme_grok2api_convert_strategy": "missing",
+    "build_liveness_enabled": True,
+    "build_liveness_model": "grok-4.5",
+    "build_liveness_prompt": "hi",
+    "build_liveness_timeout_sec": 60,
+    "build_liveness_base_url": "",
+    "build_liveness_client_version": "",
+    "build_liveness_user_agent": "",
+    "build_liveness_client_identifier": "",
+    "build_liveness_token_auth": "",
+    "build_liveness_fetch_cli_from_chenyme": True,
+    "build_liveness_cli_cache_ttl_sec": 3600,
     "email_provider": "duckmail",
     "yyds_api_key": "",
     "yyds_jwt": "",
@@ -111,7 +122,8 @@ def validate_config_structure(raw):
         "grok2api_allow_legacy_full_save", "cpa_export_enabled",
         "cpa_copy_to_hotload", "cpa_headless", "cpa_force_standalone",
         "cpa_mint_cookie_inject", "proxy_ipcheck", "remote_import_use_proxy",
-        "mail_use_proxy",
+        "mail_use_proxy", "build_liveness_enabled",
+        "build_liveness_fetch_cli_from_chenyme",
     )
     for key in bool_keys:
         cfg[key] = _require_bool(cfg, key)
@@ -119,6 +131,8 @@ def validate_config_structure(raw):
     cfg["cpa_mint_timeout_sec"] = _require_int(cfg, "cpa_mint_timeout_sec", 30, 1800)
     cfg["cpa_oidc_request_timeout_sec"] = _require_int(cfg, "cpa_oidc_request_timeout_sec", 3, 120)
     cfg["cpa_oidc_poll_timeout_sec"] = _require_int(cfg, "cpa_oidc_poll_timeout_sec", 3, 120)
+    cfg["build_liveness_timeout_sec"] = _require_int(cfg, "build_liveness_timeout_sec", 5, 300)
+    cfg["build_liveness_cli_cache_ttl_sec"] = _require_int(cfg, "build_liveness_cli_cache_ttl_sec", 60, 86400)
     string_keys = tuple(key for key, value in DEFAULT_CONFIG.items() if isinstance(value, str))
     path_keys = {"grok2api_local_token_file", "api_reverse_tools", "cpa_auth_dir", "cpa_hotload_dir"}
     for key in string_keys:

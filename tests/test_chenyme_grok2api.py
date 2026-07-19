@@ -42,6 +42,7 @@ class ChenymeGrok2ApiTests(unittest.TestCase):
             "chenyme_grok2api_password": "secret",
             "chenyme_grok2api_convert": True,
             "chenyme_grok2api_convert_strategy": "missing",
+            "build_liveness_enabled": True,
         })
 
     def tearDown(self):
@@ -223,13 +224,16 @@ class ChenymeGrok2ApiTests(unittest.TestCase):
         with patch.object(app, "CurlMime", return_value=fake_mime), \
                 patch.object(app.requests, "post", side_effect=fake_req_post), \
                 patch.object(app, "remote_import_http_post", side_effect=fake_http_post), \
-                patch.object(app, "chenyme_check_bot_flag", return_value=None):
+                patch.object(app, "chenyme_export_accounts", return_value=[]), \
+                patch.object(app, "chenyme_check_bot_flag", return_value=None), \
+                patch.object(app, "chenyme_probe_build_liveness", return_value={"ok": True, "skipped": False}) as probe:
             ok = app.add_token_to_chenyme_grok2api("sso=abc", email="a@example.com")
 
         self.assertTrue(ok)
         self.assertTrue(any(u.endswith("/auth/login") for u in post_calls))
         self.assertTrue(any(u.endswith("/accounts/web/import") for u in req_calls))
         self.assertTrue(any(u.endswith("/accounts/web/convert-to-build") for u in post_calls))
+        probe.assert_called_once()
 
     def test_import_multipart_uses_proxy_when_enabled(self):
         app.config["remote_import_use_proxy"] = True
