@@ -648,6 +648,60 @@ def available_count() -> int:
         return len(_available)
 
 
+def list_available_proxies() -> list[str]:
+    """非破坏性快照当前健康缓存中的代理 URL。"""
+    with _health_lock:
+        return list(_available)
+
+
+def _expand_pool_entry_literal(entry: str) -> str:
+    """展开条目中的 {rand} 占位符，不走 expand_proxy（避免被当前池锁定项劫持）。"""
+    text = str(entry or "").strip()
+    if not text:
+        return ""
+    if _has_placeholder(text):
+        sid = _ensure_session_id() or _new_session_id()
+        for token in _placeholder_tokens:
+            text = text.replace(token, sid)
+    return text
+
+
+def list_proxy_candidates(limit: int = 5, exclude: set[str] | None = None) -> list[str]:
+    """选出最多 limit 个待测代理：先 available，再 pool 中未 dead/未 exclude 的条目。"""
+    cap = max(int(limit or 0), 0)
+    if cap <= 0:
+        return []
+    blocked = {str(x or "").strip() for x in (exclude or set()) if str(x or "").strip()}
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(raw: str) -> bool:
+        expanded = _expand_pool_entry_literal(raw)
+        if not expanded or expanded in blocked or expanded in seen:
+            return False
+        seen.add(expanded)
+        out.append(expanded)
+        return len(out) >= cap
+
+    for url in list_available_proxies():
+        if _add(url):
+            return out
+
+    for entry in _pool_entries():
+        with _health_lock:
+            if entry in _dead:
+                continue
+        if _add(entry):
+            return out
+
+    if not out:
+        cfg = _load_config()
+        single = str(cfg.get("proxy") or "").strip()
+        if single:
+            _add(single)
+    return out[:cap]
+
+
 def scan_status() -> dict:
     with _health_lock:
         return {
