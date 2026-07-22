@@ -52,6 +52,7 @@ DEFAULT_CONFIG = {
     "cpa_force_standalone": True,
     "cpa_mint_timeout_sec": 300,
     "cpa_mint_cookie_inject": True,
+    "cpa_build_import_file": "grok2api_build_import.json",
     "cpa_oidc_request_timeout_sec": 15,
     "cpa_oidc_poll_timeout_sec": 15,
     "grok2api_allow_legacy_full_save": False,
@@ -134,7 +135,7 @@ def validate_config_structure(raw):
     cfg["build_liveness_timeout_sec"] = _require_int(cfg, "build_liveness_timeout_sec", 5, 300)
     cfg["build_liveness_cli_cache_ttl_sec"] = _require_int(cfg, "build_liveness_cli_cache_ttl_sec", 60, 86400)
     string_keys = tuple(key for key, value in DEFAULT_CONFIG.items() if isinstance(value, str))
-    path_keys = {"grok2api_local_token_file", "api_reverse_tools", "cpa_auth_dir", "cpa_hotload_dir"}
+    path_keys = {"grok2api_local_token_file", "api_reverse_tools", "cpa_auth_dir", "cpa_hotload_dir", "cpa_build_import_file"}
     for key in string_keys:
         cfg[key] = _require_string(cfg, key, path=key in path_keys)
 

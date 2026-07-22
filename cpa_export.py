@@ -1,12 +1,15 @@
 """在注册成功后可选生成 CPA xAI OIDC 凭证并复制到热加载目录。"""
 from dataclasses import dataclass
 import importlib.util
+import json
 import os
 import shutil
 import sys
 import time
 from pathlib import Path
 from typing import Optional
+
+from cpa_build_import import append_build_import, build_import_entry
 
 _ROOT = Path(__file__).resolve().parent
 _DEFAULT_AUTH_DIR = _ROOT / "cpa_auths"
@@ -27,6 +30,7 @@ class CpaExportSettings:
     force_standalone: bool
     cookie_inject: bool
     tools_dir: str
+    build_import_file: str
 
     @classmethod
     def from_config(cls, config):
@@ -38,6 +42,12 @@ class CpaExportSettings:
         hotload_dir = Path(hotload_value).expanduser() if hotload_value else None
         if hotload_dir is not None and not hotload_dir.is_absolute():
             hotload_dir = (_ROOT / hotload_dir).resolve()
+        build_import_value = str(cfg.get("cpa_build_import_file") or "").strip()
+        if build_import_value:
+            build_import_path = Path(build_import_value).expanduser()
+            if not build_import_path.is_absolute():
+                build_import_path = (_ROOT / build_import_path).resolve()
+            build_import_value = str(build_import_path)
         return cls(
             enabled=bool(cfg.get("cpa_export_enabled", True)),
             auth_dir=auth_dir,
@@ -52,6 +62,7 @@ class CpaExportSettings:
             force_standalone=bool(cfg.get("cpa_force_standalone", True)),
             cookie_inject=bool(cfg.get("cpa_mint_cookie_inject", True)),
             tools_dir=str(cfg.get("api_reverse_tools") or "").strip(),
+            build_import_file=build_import_value,
         )
 
 
@@ -179,6 +190,19 @@ def export_cpa_xai_for_account(email, password, page=None, cookies=None, sso=Non
             result["warning"] = True
             result["partial"] = True
             log("[cpa] hotload copy failed: %s" % exc)
+    if result.get("ok") and result.get("path") and settings.build_import_file:
+        try:
+            with open(str(result["path"]), "r", encoding="utf-8") as handle:
+                cpa_payload = json.load(handle)
+            entry = build_import_entry(cpa_payload)
+            append_build_import(settings.build_import_file, entry, log=log)
+            result["build_import_file"] = settings.build_import_file
+            log("[cpa] build 导入文件已更新 -> %s" % settings.build_import_file)
+        except Exception as exc:
+            result["build_import_error"] = str(exc)
+            result["warning"] = True
+            result["partial"] = True
+            log("[cpa] build 导入文件写入失败: %s" % exc)
     if not result.get("ok"):
         fail_path = settings.auth_dir / "cpa_auth_failed.txt"
         try:

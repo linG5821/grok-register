@@ -44,6 +44,7 @@
   "cpa_force_standalone": true,
   "cpa_mint_timeout_sec": 300,
   "cpa_mint_cookie_inject": true,
+  "cpa_build_import_file": "grok2api_build_import.json",
   "defaultDomains": "example.com",
   "email_provider": "cloudflare",
   "yyds_api_key": "",
