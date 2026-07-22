@@ -393,12 +393,15 @@ def _run_sso_probe_phase(
                 log(f"[*] {email} {phase_name} convert proxy={proxy[:48]}…")
             tokens = do_convert(sso_token, proxy=proxy, timeout=90, log=log)
         except SSOConvertError as exc:
-            if exc.code == "sso_expired":
+            # SSO 本身失效 / cookie 被拒：换代理无意义，立刻停
+            if exc.code in ("sso_expired", "approve_unauthorized", "verify_unauthorized") or (
+                getattr(exc, "permanent", False) and exc.http_status == 401
+            ):
                 attempts.append({
                     "phase": phase_name,
                     "proxy": proxy,
                     "http_code": exc.http_status,
-                    "status": "sso_expired",
+                    "status": "sso_expired" if exc.code == "sso_expired" else "convert_error",
                     "error": str(exc)[:300],
                     "preview": "",
                 })

@@ -156,6 +156,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="SSO Device Flow Build 复测 + SSO 重抽")
     parser.add_argument("--emails", default="", help="邮箱列表文件，每行一个；不指定则全量")
     parser.add_argument("--max-proxies", type=int, default=5, help="每号最多换代理数（默认 5）")
+    parser.add_argument("--workers", type=int, default=8, help="并发账号数（默认 8）")
     parser.add_argument("--model", default="", help="覆盖 build_liveness_model")
     parser.add_argument("--no-refresh", action="store_true", help="跳过 Build refresh 路")
     parser.add_argument("--enable-relogin", action="store_true", help="SSO 过期时浏览器重抽")
@@ -248,16 +249,70 @@ def main(argv: list[str] | None = None) -> int:
     import_path = os.path.join(out_dir, f"reprobe_build_import_{stamp}.json")
 
     from build_liveness import _decode_jwt_payload
-    import_accounts: list[dict] = []
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
 
+    import_accounts: list[dict] = []
+    import_lock = threading.Lock()
+    write_lock = threading.Lock()
     rows: list[dict[str, Any]] = []
-    for i, email in enumerate(emails, 1):
-        _log(f"--- [{i}/{len(emails)}] {email} ---")
+    workers = max(1, int(args.workers or 1))
+    # relogin 开浏览器，并发过高易炸；默认降到 2
+    if args.enable_relogin and workers > 2 and not args.dry_run:
+        _log(f"[*] --enable-relogin 限制 workers {workers} → 2（浏览器并发）")
+        workers = 2
+    _log(f"[*] 并发 workers={workers}")
+
+    def _collect_import(email: str, row: dict) -> None:
+        if row.get("final_status") not in ("live_sso", "live_relogin"):
+            return
+        tokens = row.get("build_tokens") or {}
+        if not isinstance(tokens, dict):
+            return
+        access = str(tokens.get("access_token") or "").strip()
+        refresh = str(tokens.get("refresh_token") or "").strip()
+        if not (access and refresh):
+            return
+        claims = _decode_jwt_payload(access)
+        exp = int(claims.get("exp") or 0)
+        sub = str(claims.get("sub") or claims.get("principal_id") or "").strip()
+        team_id = str(claims.get("team_id") or "").strip()
+        expires_in = int(tokens.get("expires_in") or 0)
+        if exp:
+            expires_at = datetime.utcfromtimestamp(exp).strftime("%Y-%m-%dT%H:%M:%SZ")
+        elif expires_in:
+            expires_at = datetime.utcfromtimestamp(int(time.time()) + expires_in).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+        else:
+            expires_at = ""
+        with import_lock:
+            import_accounts.append({
+                "provider": "grok_build",
+                "name": email,
+                "client_id": "b1a00492-073a-47ea-816f-4c329264a828",
+                "access_token": access,
+                "refresh_token": refresh,
+                "id_token": str(tokens.get("id_token") or ""),
+                "token_type": "Bearer",
+                "scope": "",
+                "expires_at": expires_at,
+                "expires_in": expires_in,
+                "email": email,
+                "user_id": sub,
+                "principal_id": sub,
+                "team_id": team_id,
+            })
+
+    def _process_one(idx: int, email: str) -> dict:
+        _log(f"--- [{idx}/{len(emails)}] {email} ---")
         sso = merged_sso.get(email, "")
         passwd = merged_pass.get(email, "")
         creds = build_index.get(email)
 
-        # 优先 SSO probe 路
+        def log_cb(msg: str) -> None:
+            _log(f"[{email}] {msg}")
+
         if sso:
             row = reprobe.run_sso_probe_cycle(
                 email,
@@ -267,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
                 extra_proxies=extra_proxies,
                 config=cfg,
                 profile=profile,
-                log_callback=_log,
+                log_callback=log_cb,
                 dry_run=bool(args.dry_run),
             )
         elif creds and not args.no_refresh:
@@ -280,7 +335,7 @@ def main(argv: list[str] | None = None) -> int:
                 config=cfg,
                 profile=profile,
                 refresh_fn=None if args.dry_run else refresh_access_token,
-                log_callback=_log,
+                log_callback=log_cb,
                 dry_run=bool(args.dry_run),
             )
         else:
@@ -290,49 +345,35 @@ def main(argv: list[str] | None = None) -> int:
                 "error": "no sso token, no build token or refresh disabled",
             }
 
-        # 收集 chenyme grok2api 导入格式（live_sso / live_relogin 才有新 tokens）
-        if row.get("final_status") in ("live_sso", "live_relogin"):
-            tokens = row.get("build_tokens") or {}
-            access = str(tokens.get("access_token") or "").strip()
-            refresh = str(tokens.get("refresh_token") or "").strip()
-            if access and refresh:
-                claims = _decode_jwt_payload(access)
-                exp = int(claims.get("exp") or 0)
-                sub = str(claims.get("sub") or claims.get("principal_id") or "").strip()
-                team_id = str(claims.get("team_id") or "").strip()
-                expires_in = int(tokens.get("expires_in") or 0)
-                if exp:
-                    expires_at = datetime.utcfromtimestamp(exp).strftime("%Y-%m-%dT%H:%M:%SZ")
-                elif expires_in:
-                    expires_at = datetime.utcfromtimestamp(
-                        int(time.time()) + expires_in
-                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                else:
-                    expires_at = ""
-                import_accounts.append({
-                    "provider": "grok_build",
-                    "name": email,
-                    "client_id": "b1a00492-073a-47ea-816f-4c329264a828",
-                    "access_token": access,
-                    "refresh_token": refresh,
-                    "id_token": str(tokens.get("id_token") or ""),
-                    "token_type": "Bearer",
-                    "scope": "",
-                    "expires_at": expires_at,
-                    "expires_in": expires_in,
-                    "email": email,
-                    "user_id": sub,
-                    "principal_id": sub,
-                    "team_id": team_id,
-                })
-
-        # 写 jsonl 时不带内部 tokens
-        rows.append(row)
+        _collect_import(email, row)
         clean_row = {k: v for k, v in row.items() if k != "build_tokens"}
-        try:
-            bl.append_liveness_jsonl(out_path, clean_row)
-        except Exception as exc:
-            _log(f"[Debug] 写结果失败: {exc}")
+        with write_lock:
+            try:
+                bl.append_liveness_jsonl(out_path, clean_row)
+            except Exception as exc:
+                _log(f"[Debug] 写结果失败: {exc}")
+        return row
+
+    if workers <= 1:
+        for i, email in enumerate(emails, 1):
+            rows.append(_process_one(i, email))
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_process_one, i, email): email
+                for i, email in enumerate(emails, 1)
+            }
+            for fut in as_completed(futures):
+                email = futures[fut]
+                try:
+                    rows.append(fut.result())
+                except Exception as exc:
+                    _log(f"[!] {email} worker crash: {exc}")
+                    rows.append({
+                        "email": email,
+                        "final_status": "error",
+                        "error": f"worker_crash:{exc}"[:300],
+                    })
 
     summary = reprobe.summarize_results(rows)
     parts = [f"{k}={v}" for k, v in sorted(summary.items()) if k != "total"]
