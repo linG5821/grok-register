@@ -245,6 +245,10 @@ def main(argv: list[str] | None = None) -> int:
     os.makedirs(out_dir, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = os.path.join(out_dir, f"reprobe_sso_{stamp}.jsonl")
+    import_path = os.path.join(out_dir, f"reprobe_build_import_{stamp}.json")
+
+    from build_liveness import _decode_jwt_payload
+    import_accounts: list[dict] = []
 
     rows: list[dict[str, Any]] = []
     for i, email in enumerate(emails, 1):
@@ -286,9 +290,47 @@ def main(argv: list[str] | None = None) -> int:
                 "error": "no sso token, no build token or refresh disabled",
             }
 
+        # 收集 chenyme grok2api 导入格式（live_sso / live_relogin 才有新 tokens）
+        if row.get("final_status") in ("live_sso", "live_relogin"):
+            tokens = row.get("build_tokens") or {}
+            access = str(tokens.get("access_token") or "").strip()
+            refresh = str(tokens.get("refresh_token") or "").strip()
+            if access and refresh:
+                claims = _decode_jwt_payload(access)
+                exp = int(claims.get("exp") or 0)
+                sub = str(claims.get("sub") or claims.get("principal_id") or "").strip()
+                team_id = str(claims.get("team_id") or "").strip()
+                expires_in = int(tokens.get("expires_in") or 0)
+                if exp:
+                    expires_at = datetime.utcfromtimestamp(exp).strftime("%Y-%m-%dT%H:%M:%SZ")
+                elif expires_in:
+                    expires_at = datetime.utcfromtimestamp(
+                        int(time.time()) + expires_in
+                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                else:
+                    expires_at = ""
+                import_accounts.append({
+                    "provider": "grok_build",
+                    "name": email,
+                    "client_id": "b1a00492-073a-47ea-816f-4c329264a828",
+                    "access_token": access,
+                    "refresh_token": refresh,
+                    "id_token": str(tokens.get("id_token") or ""),
+                    "token_type": "Bearer",
+                    "scope": "",
+                    "expires_at": expires_at,
+                    "expires_in": expires_in,
+                    "email": email,
+                    "user_id": sub,
+                    "principal_id": sub,
+                    "team_id": team_id,
+                })
+
+        # 写 jsonl 时不带内部 tokens
         rows.append(row)
+        clean_row = {k: v for k, v in row.items() if k != "build_tokens"}
         try:
-            bl.append_liveness_jsonl(out_path, row)
+            bl.append_liveness_jsonl(out_path, clean_row)
         except Exception as exc:
             _log(f"[Debug] 写结果失败: {exc}")
 
@@ -296,6 +338,16 @@ def main(argv: list[str] | None = None) -> int:
     parts = [f"{k}={v}" for k, v in sorted(summary.items()) if k != "total"]
     _log(f"[+] 完成 total={summary.get('total', 0)} " + " ".join(parts))
     _log(f"[+] 结果: {out_path}")
+    if import_accounts:
+        try:
+            with open(import_path, "w", encoding="utf-8") as handle:
+                json.dump({"accounts": import_accounts}, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+            _log(f"[+] 可导入 grok2api Build ({len(import_accounts)} 个): {import_path}")
+        except Exception as exc:
+            _log(f"[!] 写导入 JSON 失败: {exc}")
+    else:
+        _log("[*] 无可用 Build tokens 生成导入文件")
     return 0
 
 

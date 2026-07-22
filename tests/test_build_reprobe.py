@@ -173,6 +173,9 @@ class TestSSOProbeCycle(unittest.TestCase):
         self.assertEqual(result["final_status"], "live_sso")
         self.assertEqual(result["sso_source"], "input")
         self.assertIn("p1", result["proxies_tried"])
+        # 关键：build_tokens 应该被带出来，供导出 chenyme 格式
+        self.assertEqual(result["build_tokens"]["access_token"], "build_123")
+        self.assertEqual(result["build_tokens"]["refresh_token"], "rt_1")
 
     def test_sso_expired_no_password(self):
         from build_sso_convert import SSOConvertError

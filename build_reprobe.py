@@ -460,6 +460,7 @@ def _run_sso_probe_phase(
         }
         attempts.append(attempt)
         if result.get("ok") and result.get("status") == "live":
+            result["_tokens"] = tokens
             return result, attempts, bot_flag
 
     return None, attempts, None
@@ -545,6 +546,7 @@ def run_sso_probe_cycle(
         record["live_proxy"] = str(live.get("proxy") or "")
         record["client_version"] = live.get("client_version") or record["client_version"]
         record["bot_flag"] = bot_flag
+        record["build_tokens"] = live.get("_tokens") or {}
         if log:
             log(f"[+] {email_n}: live_sso via {record['live_proxy'][:48]}")
         return record
@@ -635,6 +637,7 @@ def run_sso_probe_cycle(
             record["live_proxy"] = str(live_b.get("proxy") or "")
             record["client_version"] = live_b.get("client_version") or record["client_version"]
             record["bot_flag"] = bot_flag_b
+            record["build_tokens"] = live_b.get("_tokens") or {}
             if log:
                 log(f"[+] {email_n}: live_relogin via {record['live_proxy'][:48]}")
             return record
