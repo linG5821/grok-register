@@ -40,6 +40,39 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+# 有效 SSO 访问 accounts.x.ai 会 3xx 跳进 app；只有跳到这些路径才是真过期。
+_SIGNIN_MARKERS = ("sign-in", "signin", "/login", "log-in", "/auth/")
+
+
+def _is_signin_location(location: str) -> bool:
+    loc = str(location or "").lower()
+    return any(marker in loc for marker in _SIGNIN_MARKERS)
+
+
+def _raise_for_accounts_httperror(exc: urllib.error.HTTPError) -> None:
+    """分类 accounts.x.ai 的 HTTPError。
+
+    3xx 且 Location 跳 sign-in → sso_expired（permanent）。
+    3xx 其它 → 登录态有效，视为成功（return，不抛）。
+    其它状态码 → 网络/服务端错误。
+    """
+    location = str(exc.headers.get("Location") or "")
+    if exc.code in (301, 302, 303, 307, 308):
+        if _is_signin_location(location):
+            raise SSOConvertError(
+                "sso expired: redirect to sign-in",
+                permanent=True,
+                code="sso_expired",
+                http_status=exc.code,
+            )
+        return  # 有效 SSO：已登录，跳转进 app
+    raise SSOConvertError(
+        f"accounts.x.ai HTTP {exc.code}",
+        code=f"accounts_http_{exc.code}",
+        http_status=exc.code,
+    )
+
+
 def _cookie_header(cookies: dict[str, str]) -> str:
     return "; ".join(f"{k}={v}" for k, v in cookies.items() if v)
 
@@ -202,7 +235,7 @@ def sso_to_build(
             return _mock_post(url, form, cookies=cookies, **kwargs)
         return _post_form_with_cookies(url, form, cookies=cookies, **kwargs)
 
-    # Step 1: 校验 SSO（禁止跟随 302，才能看到 Location: sign-in）
+    # Step 1: 校验 SSO（禁止跟随 3xx，才能读 Location 判断是否跳 sign-in）
     try:
         if log:
             log(f"[SSO] 1/6 verify accounts.x.ai {proxy}")
@@ -212,35 +245,11 @@ def sso_to_build(
         try:
             _ = do_get(ACCOUNTS_URL, cookies, proxy=proxy, timeout=timeout)
         except urllib.error.HTTPError as exc:
-            location = str(exc.headers.get("Location") or "").lower()
-            if exc.code in (301, 302, 303, 307, 308) and "sign-in" in location:
-                raise SSOConvertError(
-                    "sso expired: 302 to sign-in",
-                    permanent=True,
-                    code="sso_expired",
-                    http_status=exc.code,
-                )
-            raise SSOConvertError(
-                f"accounts.x.ai HTTP {exc.code}",
-                code=f"accounts_http_{exc.code}",
-                http_status=exc.code,
-            )
+            _raise_for_accounts_httperror(exc)
         except Exception as exc:
             raise SSOConvertError(f"accounts.x.ai failed: {exc}", code="accounts_net_error") from exc
     except urllib.error.HTTPError as exc:
-        location = str(exc.headers.get("Location") or "").lower()
-        if exc.code in (301, 302, 303, 307, 308) and "sign-in" in location:
-            raise SSOConvertError(
-                "sso expired: 302 to sign-in",
-                permanent=True,
-                code="sso_expired",
-                http_status=exc.code,
-            )
-        raise SSOConvertError(
-            f"accounts.x.ai HTTP {exc.code}",
-            code=f"accounts_http_{exc.code}",
-            http_status=exc.code,
-        )
+        _raise_for_accounts_httperror(exc)
     except Exception as exc:
         raise SSOConvertError(f"accounts.x.ai failed: {exc}", code="accounts_net_error") from exc
 

@@ -17,6 +17,59 @@ class TestSSOConvert(unittest.TestCase):
             self.assertTrue(cm.exception.permanent)
             self.assertEqual(cm.exception.code, "sso_expired")
 
+    def test_307_not_signin_proceeds(self):
+        """有效 SSO 访问 accounts.x.ai 会 307 跳进 app（Location 非 sign-in），
+        应放行继续 device flow，而不是当错误。回归：曾把所有 307 判死。"""
+        from build_sso_convert import sso_to_build
+
+        def mock_get(url, cookies, **kwargs):
+            # step 1 (accounts.x.ai) 307 跳 grok.com，非 sign-in
+            if "accounts.x.ai" in url and "device" not in url:
+                headers = {"Location": "https://grok.com/"}
+                raise urllib.error.HTTPError(url, 307, "Temporary Redirect", headers, None)
+            resp = MagicMock()
+            resp.status = 200
+            return resp
+
+        def mock_post(url, form, **kwargs):
+            if "device/code" in url:
+                return 200, {
+                    "device_code": "D1",
+                    "user_code": "U1",
+                    "verification_uri_complete": "https://auth.x.ai/device?code=U1",
+                    "interval": 1,
+                    "expires_in": 60,
+                }
+            if "device/verify" in url:
+                return 302, ""
+            if "device/approve" in url:
+                return 200, {"ok": 1}
+            if "token" in url:
+                return 200, {
+                    "access_token": "atk_ok",
+                    "refresh_token": "rt_ok",
+                    "id_token": "id",
+                    "expires_in": 3600,
+                }
+            raise NotImplementedError(url)
+
+        tokens = sso_to_build("valid-sso", _mock_post=mock_post, _mock_get=mock_get)
+        self.assertEqual(tokens["access_token"], "atk_ok")
+
+    def test_307_to_signin_is_expired(self):
+        """307 跳 sign-in = SSO 真过期。"""
+        from build_sso_convert import sso_to_build, SSOConvertError
+
+        def mock_get(url, cookies, **kwargs):
+            headers = {"Location": "https://accounts.x.ai/sign-in?redirect=/"}
+            raise urllib.error.HTTPError(url, 307, "Temporary Redirect", headers, None)
+
+        with patch("build_sso_convert._get_with_cookies", mock_get):
+            with self.assertRaises(SSOConvertError) as cm:
+                sso_to_build("dead-token")
+            self.assertTrue(cm.exception.permanent)
+            self.assertEqual(cm.exception.code, "sso_expired")
+
     def test_device_flow_happy_path_posts_cookies(self):
         """verify/approve 必须带 sso cookie，否则服务端 401。"""
         from build_sso_convert import sso_to_build
