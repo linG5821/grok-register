@@ -33,3 +33,5 @@ scripts/config.proxy_pool.snippet.json
 scripts/mihomo-listeners.generated.yaml
 scripts/mihomo-pool.yaml
 scripts/proxy_pool.generated.json
+liveness*.jsonl
+reprobe_*.jsonl

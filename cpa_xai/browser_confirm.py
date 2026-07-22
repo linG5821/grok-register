@@ -19,6 +19,7 @@ from .browser_session import (
     clear_page_session, normalize_cookies, inject_cookies, acquire_mint_browser,
     release_mint_browser, shutdown_mint_browsers,
 )
+from .proxyutil import resolve_proxy, set_runtime_proxy
 
 
 
@@ -638,3 +639,119 @@ def mint_with_browser(
                 close_standalone(own_browser)
             else:
                 release_mint_browser(owned=False, success=success, log=logger)
+
+
+def relogin_to_fetch_sso(
+    email: str,
+    password: str,
+    proxy: Optional[str] = None,
+    cancel: Optional[Callable[[], bool]] = None,
+    log: Optional[LogFn] = None,
+    headless: bool = True,
+    timeout_sec: float = 180.0,
+) -> str:
+    """重开 Chromium 登录 x.ai，拿到 sso cookie。
+
+    仅登录，不授权 Device Flow。登录成功后进入 accounts.x.ai，
+    提取 Cookie: sso=xxx 值。
+
+    抛出 BrowserConfirmError 表示登录失败。
+    """
+    logger = log or _noop_log
+    resolved = resolve_proxy(proxy)
+    set_runtime_proxy(resolved or None)
+    browser, page = create_standalone_page(proxy=resolved, headless=headless, log=logger)
+    login_attempts = 0
+    deadline = time.time() + max(float(timeout_sec), 60)
+    phase = "init"
+
+    try:
+        if isinstance(page, str):
+            raise BrowserConfirmError("failed to create browser page")
+        page.get("https://accounts.x.ai/login")
+        while time.time() < deadline:
+            if cancel and cancel():
+                raise BrowserConfirmError("cancelled")
+
+            url = _page_url(page)
+            text = _visible_text(page)
+
+            if "sign-in" not in url.lower() and "/account" in url.lower():
+                # 已登录成功，抓 sso cookie
+                cookies = page.cookies(all_domains=True, all_info=True) or []
+                sso_value = ""
+                for item in cookies:
+                    if isinstance(item, dict):
+                        name = str(item.get("name", "")).strip()
+                        value = str(item.get("value", "")).strip()
+                    else:
+                        name = str(getattr(item, "name", "")).strip()
+                        value = str(getattr(item, "value", "")).strip()
+                    if name == "sso" and value:
+                        sso_value = value
+                        break
+                if sso_value:
+                    logger("SSO cookie captured successfully")
+                    return sso_value
+                raise BrowserConfirmError("login success but sso cookie missing")
+
+            if _cookie_banner_visible(text):
+                _dismiss_cookie_banner(page, logger)
+                _sleep(0.4)
+                continue
+
+            if "使用邮箱登录" in text or "Continue with email" in text:
+                if _click_exact(page, ["使用邮箱登录", "Continue with email", "Sign in with email"], logger, real=False):
+                    _sleep(1.5)
+                    phase = "email"
+                continue
+
+            if page.ele("css:input[type='email']", timeout=0.3) and not page.ele("css:input[type='password']", timeout=0.2):
+                phase = "email"
+                _fill(page, "css:input[type='email']", email, logger, "email")
+                if _click_exact(page, ["下一步", "Next", "Continue", "继续"], logger, real=False):
+                    _sleep(1.8)
+                continue
+
+            if page.ele("css:input[type='password']", timeout=0.3):
+                phase = "password"
+                if login_attempts >= 3:
+                    auth_error = _detect_auth_error(text, url) or "login failed after 3 retries"
+                    raise BrowserConfirmError("auth failed: %s" % auth_error)
+                login_attempts += 1
+                _fill(page, "css:input[type='email']", email, logger, "email")
+                _wait_turnstile(page, logger, 25, email=email, raise_on_timeout=True)
+                _fill(page, "css:input[type='password']", password, logger, "password")
+                _wait_turnstile(page, logger, 12, email=email, raise_on_timeout=False)
+                if not _click_exact(page, ["登录", "Sign in", "Log in"], logger, real=True):
+                    try:
+                        submit = page.ele("css:button[type='submit']", timeout=0.5) or page.ele("css:button[data-testid='sign-in-submit']", timeout=0.5)
+                        if submit:
+                            submit.click()
+                    except Exception as exc:
+                        logger("login submit fail: %s" % exc)
+                for _ in range(20):
+                    if cancel and cancel():
+                        raise BrowserConfirmError("cancelled")
+                    _sleep(0.5)
+                    post = _visible_text(page)
+                    auth_error = _detect_auth_error(post, _page_url(page))
+                    if auth_error:
+                        raise BrowserConfirmError("auth failed: %s" % auth_error)
+                    if not page.ele("css:input[type='password']", timeout=0.2):
+                        break
+                    if "sign-in" not in _page_url(page).lower():
+                        break
+                continue
+
+            _sleep(1.0)
+
+        shot = _save_debug_shot(page, tag="relogin-timeout-phase-%s" % phase, email=email, log=logger)
+        message = "relogin timeout phase=%s attempts=%s" % (phase, login_attempts)
+        if shot:
+            message = "%s shot=%s" % (message, shot)
+        raise BrowserConfirmError(message)
+
+    finally:
+        if browser:
+            close_standalone(browser)

@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
-"""对邮箱列表中的 Build 号做换代理真活 + 官方 refresh 复测。
+"""SSO Device Flow 转 Build 测活 + 浏览器重抽 SSO。
+
+不指定 --emails 时默认处理 chenyme export 全量 grok_web 号。
 
 用法::
 
+    # 处理 emails.txt（仅 Device Flow，SSO 过期只记死，不重抽）
     python scripts/reprobe_build_liveness.py --emails emails.txt
-    python scripts/reprobe_build_liveness.py --emails emails.txt --dry-run
-    python scripts/reprobe_build_liveness.py --emails emails.txt --max-proxies 5 --no-refresh
+
+    # 全量 export 中 grok_web 号，SSO 过期时浏览器重抽（需要 accounts_*.txt 里密码）
+    python scripts/reprobe_build_liveness.py --enable-relogin
+
+    # dry-run：只匹配凭据/列代理
+    python scripts/reprobe_build_liveness.py --dry-run
 """
+
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import sys
@@ -65,6 +74,52 @@ def export_accounts(base: str, admin_token: str) -> list:
     return accounts if isinstance(accounts, list) else []
 
 
+def index_sso_accounts(exported: list) -> dict[str, str]:
+    """export 中 grok_web -> email -> sso_access_token。"""
+
+    index: dict[str, str] = {}
+    for account in exported or []:
+        if not isinstance(account, dict):
+            continue
+        provider = str(account.get("provider") or "").strip().lower()
+        if provider != "grok_web":
+            continue
+        email = str(account.get("name") or account.get("email") or "").strip().lower()
+        if not email or "@" not in email:
+            continue
+        access = str(account.get("access_token") or account.get("accessToken") or "").strip()
+        if access:
+            index[email] = access
+    return index
+
+
+def load_local_accounts_files() -> tuple[dict[str, str], dict[str, str]]:
+    """加载当前目录所有 accounts_*.txt，返回 email->sso 和 email->password。"""
+
+    sso_by_email: dict[str, str] = {}
+    pass_by_email: dict[str, str] = {}
+    files = glob.glob(os.path.join(ROOT, "accounts_*.txt"))
+    for path in sorted(files):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                for raw in handle:
+                    parts = raw.rstrip(chr(10)).split("----", 2)
+                    if len(parts) < 3:
+                        continue
+                    email = parts[0].strip().lower()
+                    password = parts[1].strip()
+                    sso = parts[2].strip()
+                    if not email or "@" not in email:
+                        continue
+                    if sso and email not in sso_by_email:
+                        sso_by_email[email] = sso
+                    if password and email not in pass_by_email:
+                        pass_by_email[email] = password
+        except Exception as exc:
+            _log(f"[Debug] 读取 accounts 文件失败 {path}: {exc}")
+    return sso_by_email, pass_by_email
+
+
 def load_proxy_file(path: str) -> list[str]:
     if not path:
         return []
@@ -98,11 +153,12 @@ def fetch_cli_profile(cfg: dict, base: str, admin_token: str) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Build 403 号换代理复测 + 官方 refresh")
-    parser.add_argument("--emails", required=True, help="邮箱列表文件，每行一个")
-    parser.add_argument("--max-proxies", type=int, default=5, help="每 phase 最多代理数（默认 5）")
+    parser = argparse.ArgumentParser(description="SSO Device Flow Build 复测 + SSO 重抽")
+    parser.add_argument("--emails", default="", help="邮箱列表文件，每行一个；不指定则全量")
+    parser.add_argument("--max-proxies", type=int, default=5, help="每号最多换代理数（默认 5）")
     parser.add_argument("--model", default="", help="覆盖 build_liveness_model")
-    parser.add_argument("--no-refresh", action="store_true", help="跳过官方 refresh")
+    parser.add_argument("--no-refresh", action="store_true", help="跳过 Build refresh 路")
+    parser.add_argument("--enable-relogin", action="store_true", help="SSO 过期时浏览器重抽")
     parser.add_argument("--dry-run", action="store_true", help="只匹配凭据/列代理，不探测")
     parser.add_argument("--proxy-file", default="", help="额外代理 URL 列表")
     parser.add_argument("--out-dir", default="", help="结果目录，默认项目根")
@@ -112,7 +168,6 @@ def main(argv: list[str] | None = None) -> int:
     config_path = str(args.config or "").strip()
     if config_path:
         os.environ.setdefault("GROK_REGISTER_CONFIG", config_path)
-        # app_config 使用模块级 CONFIG_FILE；临时 monkey 不够稳，直接 load 后用
     cfg = load_config()
     if args.model:
         cfg["build_liveness_model"] = str(args.model).strip()
@@ -123,17 +178,6 @@ def main(argv: list[str] | None = None) -> int:
     if not base or not username or not password:
         print("请在 config.json 配置 chenyme_grok2api_base/username/password", file=sys.stderr)
         return 2
-
-    emails_path = os.path.abspath(args.emails)
-    if not os.path.isfile(emails_path):
-        print(f"邮箱文件不存在: {emails_path}", file=sys.stderr)
-        return 2
-
-    emails = reprobe.load_emails_file(emails_path)
-    if not emails:
-        print("邮箱列表为空", file=sys.stderr)
-        return 2
-    _log(f"[*] 目标邮箱 {len(emails)} 个")
 
     extra_proxies = load_proxy_file(str(args.proxy_file or "").strip())
 
@@ -160,8 +204,36 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(f"export 失败: {exc}", file=sys.stderr)
         return 2
-    index = reprobe.index_build_accounts(exported)
-    _log(f"[*] export Build 号 {len(index)} 个；开始匹配/复测")
+
+    build_index = reprobe.index_build_accounts(exported)
+    sso_index = index_sso_accounts(exported)
+    local_sso, local_pass = load_local_accounts_files()
+
+    # chenyme 优先，本地补全
+    merged_sso: dict[str, str] = dict(local_sso)
+    merged_sso.update(sso_index)
+    merged_pass: dict[str, str] = dict(local_pass)
+
+    # 确定目标列表
+    emails: list[str] = []
+    emails_path = str(args.emails or "").strip()
+    if emails_path:
+        if not os.path.isfile(emails_path):
+            print(f"邮箱文件不存在: {emails_path}", file=sys.stderr)
+            return 2
+        emails = reprobe.load_emails_file(emails_path)
+        if not emails:
+            print("邮箱列表为空", file=sys.stderr)
+            return 2
+    else:
+        emails = list(sorted(set(merged_sso.keys()) | set(build_index.keys())))
+        emails = [e for e in emails if "@" in e]
+
+    if not emails:
+        print("没有目标邮箱", file=sys.stderr)
+        return 2
+
+    _log(f"[*] 目标邮箱 {len(emails)} 个；SSO: {len(merged_sso)} Build: {len(build_index)}")
 
     profile = fetch_cli_profile(cfg, base, admin_token)
     _log(
@@ -172,24 +244,48 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = str(args.out_dir or "").strip() or ROOT
     os.makedirs(out_dir, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = os.path.join(out_dir, f"reprobe_{stamp}.jsonl")
+    out_path = os.path.join(out_dir, f"reprobe_sso_{stamp}.jsonl")
 
     rows: list[dict[str, Any]] = []
     for i, email in enumerate(emails, 1):
         _log(f"--- [{i}/{len(emails)}] {email} ---")
-        creds = index.get(email)
-        row = reprobe.run_account_cycle(
-            email,
-            creds,
-            max_proxies=max(1, int(args.max_proxies)),
-            enable_refresh=not args.no_refresh,
-            extra_proxies=extra_proxies,
-            config=cfg,
-            profile=profile,
-            refresh_fn=None if args.dry_run else refresh_access_token,
-            log_callback=_log,
-            dry_run=bool(args.dry_run),
-        )
+        sso = merged_sso.get(email, "")
+        passwd = merged_pass.get(email, "")
+        creds = build_index.get(email)
+
+        # 优先 SSO probe 路
+        if sso:
+            row = reprobe.run_sso_probe_cycle(
+                email,
+                sso,
+                password=passwd if args.enable_relogin else "",
+                max_proxies=max(1, int(args.max_proxies)),
+                extra_proxies=extra_proxies,
+                config=cfg,
+                profile=profile,
+                log_callback=_log,
+                dry_run=bool(args.dry_run),
+            )
+        elif creds and not args.no_refresh:
+            row = reprobe.run_account_cycle(
+                email,
+                creds,
+                max_proxies=max(1, int(args.max_proxies)),
+                enable_refresh=True,
+                extra_proxies=extra_proxies,
+                config=cfg,
+                profile=profile,
+                refresh_fn=None if args.dry_run else refresh_access_token,
+                log_callback=_log,
+                dry_run=bool(args.dry_run),
+            )
+        else:
+            row = {
+                "email": email,
+                "final_status": "skipped_no_credentials",
+                "error": "no sso token, no build token or refresh disabled",
+            }
+
         rows.append(row)
         try:
             bl.append_liveness_jsonl(out_path, row)

@@ -155,5 +155,72 @@ class TestAccountCycle(unittest.TestCase):
         self.assertEqual(row["final_status"], "dry_run")
 
 
+class TestSSOProbeCycle(unittest.TestCase):
+    def test_live_sso_first_proxy(self):
+        def mock_convert(sso, proxy, **kw):
+            return {"access_token": "build_123", "refresh_token": "rt_1"}
+        def mock_probe(token, **kw):
+            return {"ok": True, "status": "live", "http_code": 200}
+
+        from unittest.mock import patch
+        with patch("build_reprobe.bl.probe_build_responses", mock_probe):
+            result = reprobe.run_sso_probe_cycle(
+                "u@x.com",
+                "valid-sso",
+                convert_fn=mock_convert,
+                list_candidates=lambda limit=5, exclude=None: ["p1"],
+            )
+        self.assertEqual(result["final_status"], "live_sso")
+        self.assertEqual(result["sso_source"], "input")
+        self.assertIn("p1", result["proxies_tried"])
+
+    def test_sso_expired_no_password(self):
+        from build_sso_convert import SSOConvertError
+        def mock_convert(sso, proxy, **kw):
+            raise SSOConvertError("sso expired", permanent=True, code="sso_expired", http_status=302)
+
+        result = reprobe.run_sso_probe_cycle(
+            "u@x.com",
+            "dead-sso",
+            password="",
+            convert_fn=mock_convert,
+            list_candidates=lambda limit=5, exclude=None: ["p1"],
+        )
+        self.assertEqual(result["final_status"], "sso_dead_norelogin")
+
+    def test_sso_expired_with_password(self):
+        from build_sso_convert import SSOConvertError
+        def mock_convert_old(sso, proxy, **kw):
+            raise SSOConvertError("sso expired", permanent=True, code="sso_expired", http_status=302)
+        def mock_convert_new(sso, proxy, **kw):
+            return {"access_token": "new_build", "refresh_token": "rt_new"}
+        def mock_relogin(email, password, **kw):
+            return "new-sso-token"
+        def mock_probe(token, **kw):
+            return {"ok": True, "status": "live", "http_code": 200}
+
+        call_count = [0]
+        def convert_router(*a, **kw):
+            if call_count[0] == 0:
+                call_count[0] += 1
+                return mock_convert_old(*a, **kw)
+            call_count[0] += 1
+            return mock_convert_new(*a, **kw)
+
+        from unittest.mock import patch
+        with patch("build_reprobe.bl.probe_build_responses", mock_probe):
+            result = reprobe.run_sso_probe_cycle(
+                "u@x.com",
+                "dead-sso",
+                password="secret",
+                convert_fn=convert_router,
+                relogin_fn=mock_relogin,
+                list_candidates=lambda limit=5, exclude=None: ["p1", "p2"],
+            )
+        self.assertEqual(result["final_status"], "live_relogin")
+        self.assertEqual(result["sso_source"], "relogin")
+        self.assertTrue(any(a.get("phase") == "relogin" for a in result["attempts"]))
+
+
 if __name__ == "__main__":
     unittest.main()

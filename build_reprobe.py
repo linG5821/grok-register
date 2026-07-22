@@ -13,6 +13,12 @@ except Exception:  # pragma: no cover
     TokenRefreshError = RuntimeError  # type: ignore
     refresh_access_token = None  # type: ignore
 
+try:
+    from build_sso_convert import SSOConvertError, sso_to_build
+except Exception:  # pragma: no cover
+    SSOConvertError = RuntimeError  # type: ignore
+    sso_to_build = None  # type: ignore
+
 
 def load_emails_file(path: str) -> list[str]:
     """读取邮箱列表：去空行、# 注释、小写去重保序。"""
@@ -340,6 +346,316 @@ def _finalize_dead_or_error(attempts: list[dict], bot_flag: Any) -> str:
     if any(s == "error" for s in statuses) and dead_hits == 0:
         return "error"
     return "dead"
+
+
+def _run_sso_probe_phase(
+    sso_token: str,
+    *,
+    phase_name: str,
+    max_proxies: int,
+    tried: set[str],
+    extra_proxies: Optional[list[str]],
+    config: Optional[dict],
+    profile: Optional[dict],
+    email: str,
+    http_post: Optional[Callable[..., Any]],
+    log: Optional[Callable[[str], None]],
+    list_candidates: Optional[Callable[..., list[str]]] = None,
+    convert_fn: Optional[Callable[..., dict]] = None,
+) -> tuple[Optional[dict], list[dict], Any]:
+    """对一个 SSO token，每代理跑 Device Flow 转 Build + 测活。
+
+    返回 (live_result_or_None, attempts, bot_flag)。
+    遇到 sso_expired 会提前返回空 + attempt + None（表示 SSO 失效需要重抽）。
+    """
+    attempts: list[dict] = []
+    proxies = _pick_proxies(max_proxies, tried, extra_proxies, list_candidates)
+    if not proxies and log:
+        log(f"[!] {email} {phase_name}: 无可用代理候选")
+
+    do_convert = convert_fn or sso_to_build
+    if do_convert is None:
+        attempts.append({
+            "phase": phase_name,
+            "proxy": "",
+            "http_code": None,
+            "status": "error",
+            "error": "sso_convert_unavailable",
+            "preview": "",
+        })
+        return None, attempts, None
+
+    for proxy in proxies:
+        tried.add(proxy)
+        # Step 1: Device Flow 转 Build token
+        try:
+            if log:
+                log(f"[*] {email} {phase_name} convert proxy={proxy[:48]}…")
+            tokens = do_convert(sso_token, proxy=proxy, timeout=90, log=log)
+        except SSOConvertError as exc:
+            if exc.code == "sso_expired":
+                attempts.append({
+                    "phase": phase_name,
+                    "proxy": proxy,
+                    "http_code": exc.http_status,
+                    "status": "sso_expired",
+                    "error": str(exc)[:300],
+                    "preview": "",
+                })
+                return None, attempts, None
+            attempts.append({
+                "phase": phase_name,
+                "proxy": proxy,
+                "http_code": exc.http_status,
+                "status": "convert_error",
+                "error": str(exc)[:300],
+                "preview": "",
+            })
+            continue
+        except Exception as exc:
+            attempts.append({
+                "phase": phase_name,
+                "proxy": proxy,
+                "http_code": None,
+                "status": "convert_error",
+                "error": str(exc)[:300],
+                "preview": "",
+            })
+            continue
+
+        access = str(tokens.get("access_token") or "").strip()
+        if not access:
+            attempts.append({
+                "phase": phase_name,
+                "proxy": proxy,
+                "http_code": None,
+                "status": "convert_error",
+                "error": "convert_empty_access",
+                "preview": "",
+            })
+            continue
+
+        # Step 2: 测活
+        bot_flag = bot_flag_from_token(access)
+        if log:
+            log(f"[*] {email} {phase_name} probe proxy={proxy[:48]}…")
+        result = bl.probe_build_responses(
+            access,
+            proxy=proxy,
+            config=config,
+            profile=profile,
+            email=email,
+            bot_flag=bot_flag,
+            http_post=http_post,
+            output_path="",
+            log_callback=None,
+        )
+        attempt = {
+            "phase": phase_name,
+            "proxy": proxy,
+            "http_code": result.get("http_code"),
+            "status": result.get("status"),
+            "error": result.get("error") or "",
+            "preview": result.get("preview") or "",
+        }
+        attempts.append(attempt)
+        if result.get("ok") and result.get("status") == "live":
+            return result, attempts, bot_flag
+
+    return None, attempts, None
+
+
+def run_sso_probe_cycle(
+    email: str,
+    sso_token: str,
+    *,
+    password: str = "",
+    max_proxies: int = 5,
+    enable_relogin: bool = True,
+    extra_proxies: Optional[list[str]] = None,
+    config: Optional[dict] = None,
+    profile: Optional[dict] = None,
+    http_post: Optional[Callable[..., Any]] = None,
+    convert_fn: Optional[Callable[..., dict]] = None,
+    relogin_fn: Optional[Callable[..., str]] = None,
+    list_candidates: Optional[Callable[..., list[str]]] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+    dry_run: bool = False,
+) -> dict:
+    """SSO Device Flow 周期：Phase A 换代理转换测活 → SSO 失效时 Phase B 重抽再试。
+
+    最终状态：live_sso | live_relogin | dead | sso_dead_norelogin | error | skipped_no_sso
+    """
+    email_n = str(email or "").strip().lower()
+    sso = str(sso_token or "").strip()
+    if sso.lower().startswith("sso="):
+        sso = sso[4:].strip()
+
+    record = {
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "email": email_n,
+        "final_status": "error",
+        "bot_flag": None,
+        "sso_source": "input",
+        "refreshed": False,
+        "proxies_tried": [],
+        "attempts": [],
+        "live_proxy": "",
+        "client_version": (profile or {}).get("client_version", ""),
+        "model": str((config or {}).get("build_liveness_model") or bl.DEFAULT_MODEL),
+        "error": "",
+    }
+    log = log_callback
+
+    if not sso:
+        record["final_status"] = "skipped_no_sso"
+        record["error"] = "no_sso_token"
+        if log:
+            log(f"[Debug] {email_n}: skipped_no_sso")
+        return record
+
+    if dry_run:
+        proxies = _pick_proxies(max_proxies, set(), extra_proxies, list_candidates)
+        record["final_status"] = "dry_run"
+        record["proxies_tried"] = proxies
+        record["error"] = f"dry_run sso_candidates={len(proxies)} relogin={'yes' if password else 'no'}"
+        return record
+
+    tried: set[str] = set()
+
+    # Phase A: 原始 SSO
+    live, attempts_a, bot_flag = _run_sso_probe_phase(
+        sso,
+        phase_name="sso_a",
+        max_proxies=max_proxies,
+        tried=tried,
+        extra_proxies=extra_proxies,
+        config=config,
+        profile=profile,
+        email=email_n,
+        http_post=http_post,
+        log=log,
+        list_candidates=list_candidates,
+        convert_fn=convert_fn,
+    )
+    record["attempts"].extend(attempts_a)
+    record["proxies_tried"] = list(tried)
+    if live:
+        record["final_status"] = "live_sso"
+        record["live_proxy"] = str(live.get("proxy") or "")
+        record["client_version"] = live.get("client_version") or record["client_version"]
+        record["bot_flag"] = bot_flag
+        if log:
+            log(f"[+] {email_n}: live_sso via {record['live_proxy'][:48]}")
+        return record
+
+    # 检查是否是 SSO 本身过期（首代理 302 sign-in）
+    last_status = None
+    if attempts_a:
+        last_status = str(attempts_a[0].get("status") or "")
+    is_sso_dead = last_status == "sso_expired"
+
+    if is_sso_dead and enable_relogin:
+        if not password:
+            record["final_status"] = "sso_dead_norelogin"
+            record["error"] = "sso_expired_but_no_password"
+            if log:
+                log(f"[!] {email_n}: sso_dead_norelogin (no password)")
+            return record
+
+        # Phase B: 浏览器重抽 SSO
+        do_relogin = relogin_fn
+        if do_relogin is None:
+            try:
+                from cpa_xai.browser_confirm import relogin_to_fetch_sso
+                do_relogin = relogin_to_fetch_sso
+            except Exception:
+                do_relogin = None
+
+        if do_relogin is None:
+            record["final_status"] = "error"
+            record["error"] = "relogin_unavailable"
+            if log:
+                log(f"[!] {email_n}: relogin function unavailable")
+            return record
+
+        try:
+            if log:
+                log(f"[*] {email_n}: browser relogin to fetch new SSO…")
+            new_sso = do_relogin(email_n, password, proxy=None, cancel=None, log=log)
+            new_sso = str(new_sso or "").strip()
+            if new_sso.lower().startswith("sso="):
+                new_sso = new_sso[4:].strip()
+            if not new_sso:
+                raise RuntimeError("empty sso from relogin")
+            record["sso_source"] = "relogin"
+            record["attempts"].append({
+                "phase": "relogin",
+                "proxy": "",
+                "http_code": 200,
+                "status": "ok",
+                "error": "",
+                "preview": "",
+            })
+        except Exception as exc:
+            record["attempts"].append({
+                "phase": "relogin",
+                "proxy": "",
+                "http_code": None,
+                "status": "relogin_failed",
+                "error": str(exc)[:300],
+                "preview": "",
+            })
+            permanent = bool(getattr(exc, "permanent", False))
+            record["final_status"] = "dead" if permanent else "error"
+            record["error"] = f"relogin_failed:{exc}"[:300]
+            if log:
+                log(f"[!] {email_n}: relogin failed: {exc}")
+            return record
+
+        # Phase B': 新 SSO 再跑一遍（换代理）
+        live_b, attempts_b, bot_flag_b = _run_sso_probe_phase(
+            new_sso,
+            phase_name="sso_b",
+            max_proxies=max_proxies,
+            tried=tried,
+            extra_proxies=extra_proxies,
+            config=config,
+            profile=profile,
+            email=email_n,
+            http_post=http_post,
+            log=log,
+            list_candidates=list_candidates,
+            convert_fn=convert_fn,
+        )
+        record["attempts"].extend(attempts_b)
+        record["proxies_tried"] = list(tried)
+        if live_b:
+            record["final_status"] = "live_relogin"
+            record["live_proxy"] = str(live_b.get("proxy") or "")
+            record["client_version"] = live_b.get("client_version") or record["client_version"]
+            record["bot_flag"] = bot_flag_b
+            if log:
+                log(f"[+] {email_n}: live_relogin via {record['live_proxy'][:48]}")
+            return record
+
+    # 全部失败
+    if is_sso_dead:
+        record["final_status"] = "dead"
+        record["error"] = "sso_expired_all_proxies"
+    else:
+        all_attempts = record["attempts"]
+        dead_hits = sum(1 for a in all_attempts if str(a.get("status")) == "dead")
+        if dead_hits >= 2:
+            record["final_status"] = "dead"
+        else:
+            record["final_status"] = "error"
+        if not record["error"]:
+            record["error"] = "sso_all_proxies_failed"
+
+    if log:
+        log(f"[!] {email_n}: {record['final_status']} {record['error']}")
+    return record
 
 
 def summarize_results(rows: list[dict]) -> dict[str, int]:
