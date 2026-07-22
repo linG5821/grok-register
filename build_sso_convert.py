@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Callable, Optional
 
@@ -33,11 +34,8 @@ def _get_with_cookies(url: str, cookies: dict[str, str], proxy: str = "", timeou
     cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
     request = urllib.request.Request(url, headers={"Cookie": cookie_str, "User-Agent": "grok-register-sso/1.0"})
     if proxy:
-        import urllib.parse
-        from urllib.request import ProxyHandler, build_opener
-
         proxy_type = urllib.parse.urlparse(proxy).scheme or "http"
-        opener = build_opener(ProxyHandler({proxy_type: proxy}))
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({proxy_type: proxy}))
         return opener.open(request, timeout=timeout)
     return urllib.request.urlopen(request, timeout=timeout)
 

@@ -55,6 +55,26 @@ class TestSSOConvert(unittest.TestCase):
         self.assertTrue(any("device/code" in str(c) for c in call_log))
         self.assertTrue(any("device/approve" in str(c) for c in call_log))
 
+    def test_get_with_cookies_no_proxy_no_scope_bug(self):
+        """回归测试：曾把 import urllib.parse 塞在 if 分支里，
+        导致 urllib 变成局部变量遮蔽顶部 import。走 no-proxy 路径就炸。"""
+        from build_sso_convert import _get_with_cookies
+        resp = MagicMock()
+        resp.status = 200
+        with patch("urllib.request.urlopen", return_value=resp):
+            r = _get_with_cookies("https://accounts.x.ai/", {"sso": "x"}, proxy="")
+        self.assertEqual(r.status, 200)
+
+    def test_get_with_cookies_with_proxy(self):
+        from build_sso_convert import _get_with_cookies
+        resp = MagicMock()
+        resp.status = 200
+        opener = MagicMock()
+        opener.open.return_value = resp
+        with patch("urllib.request.build_opener", return_value=opener):
+            r = _get_with_cookies("https://accounts.x.ai/", {"sso": "x"}, proxy="http://p:1")
+        self.assertEqual(r.status, 200)
+
 
 if __name__ == "__main__":
     unittest.main()
