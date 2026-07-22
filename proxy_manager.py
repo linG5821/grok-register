@@ -62,6 +62,15 @@ _scan_thread: threading.Thread | None = None
 _health_logger = None
 _DEAD_COOLDOWN_SEC = 60.0
 
+# dead 从 config.proxy_pool 删除（只删不写活；debounce 批量原子写盘）
+_config_write_lock = threading.Lock()
+_pending_pool_remove: set[str] = set()
+_pending_remove_reason: str = ""
+_remove_flush_timer: threading.Timer | None = None
+_REMOVE_DEBOUNCE_SEC = 1.0
+# 测试可置 False，避免写真实 config.json
+persist_dead_pool_removals: bool = True
+
 # 账号级代理绑定：后处理真活探测需用注册时出口，而非 rotate 后的节点
 _account_proxy_lock = threading.RLock()
 _account_proxy_by_email: dict[str, str] = {}
@@ -628,6 +637,122 @@ def _mark_dead_locked(url: str) -> None:
         pass
 
 
+def schedule_remove_dead_from_pool(urls: set[str] | list[str] | str, reason: str = "") -> None:
+    """排队从 config.proxy_pool 删除 dead URL（debounce 后原子写盘）。只删不覆盖。"""
+    if isinstance(urls, str):
+        items = {urls.strip()} if urls.strip() else set()
+    else:
+        items = {str(u or "").strip() for u in urls if str(u or "").strip()}
+    if not items:
+        return
+    global _remove_flush_timer, _pending_remove_reason
+    with _config_write_lock:
+        _pending_pool_remove.update(items)
+        if reason:
+            _pending_remove_reason = str(reason)
+        if _remove_flush_timer is not None:
+            try:
+                _remove_flush_timer.cancel()
+            except Exception:
+                pass
+        delay = max(float(_REMOVE_DEBOUNCE_SEC), 0.0)
+        if delay <= 0:
+            # 同步 flush（测试）
+            pass
+        else:
+            t = threading.Timer(delay, _flush_pending_proxy_removals_safe)
+            t.daemon = True
+            _remove_flush_timer = t
+            t.start()
+            return
+    flush_pending_proxy_removals()
+
+
+def _flush_pending_proxy_removals_safe() -> None:
+    try:
+        flush_pending_proxy_removals()
+    except Exception as exc:
+        _health_log("[!] proxy_pool 移除 flush 失败: %s" % exc)
+
+
+def flush_pending_proxy_removals() -> int:
+    """立刻把 pending dead 从 config.proxy_pool 删除并 save_config。返回删除条数。"""
+    global _remove_flush_timer, _pending_remove_reason
+    with _config_write_lock:
+        if _remove_flush_timer is not None:
+            try:
+                _remove_flush_timer.cancel()
+            except Exception:
+                pass
+            _remove_flush_timer = None
+        pending = set(_pending_pool_remove)
+        _pending_pool_remove.clear()
+        reason = _pending_remove_reason or "dead"
+        _pending_remove_reason = ""
+        if not pending:
+            return 0
+        # 持锁调用内部实现，避免与 remove_dead_from_config 外层锁死锁
+        return _remove_dead_from_config_locked(pending, reason=reason)
+
+
+def remove_dead_from_config(urls: set[str] | list[str], reason: str = "") -> int:
+    """从 config.proxy_pool 移除给定 URL（池原文匹配）。只删不写活；原子 save_config。
+
+    返回实际删除条数。new_pool==old 时不写盘。
+    """
+    remove_set = {str(u or "").strip() for u in urls if str(u or "").strip()}
+    if not remove_set:
+        return 0
+    with _config_write_lock:
+        return _remove_dead_from_config_locked(remove_set, reason=reason)
+
+
+def _remove_dead_from_config_locked(remove_set: set[str], reason: str = "") -> int:
+    """调用方必须已持有 _config_write_lock。"""
+    try:
+        from app_config import config as cfg_obj
+        from app_config import save_config
+    except Exception:
+        return 0
+
+    pool = cfg_obj.get("proxy_pool") or []
+    if not isinstance(pool, list):
+        return 0
+    new_pool: list[str] = []
+    removed: list[str] = []
+    for entry in pool:
+        text = str(entry or "").strip()
+        if not text:
+            continue
+        if text in remove_set:
+            removed.append(text)
+            continue
+        new_pool.append(text)
+    if not removed:
+        return 0
+    # 先改内存，再原子写盘（save_config 用 tmp+replace，中断不丢整文件）
+    cfg_obj["proxy_pool"] = new_pool
+    if not persist_dead_pool_removals:
+        _health_log(
+            "[!] proxy_pool 移除 dead (%s): %s 条 剩余 %s (persist=off)"
+            % (reason or "dead", len(removed), len(new_pool))
+        )
+        return len(removed)
+    try:
+        save_config()
+    except Exception as exc:
+        _health_log("[!] proxy_pool 移除写盘失败: %s" % exc)
+        # 内存已删，本进程仍跳过；磁盘保持旧内容直至下次成功 save
+        return 0
+    labels = ", ".join(_safe_label(u) for u in removed[:5])
+    extra = "…" if len(removed) > 5 else ""
+    _health_log(
+        "[!] proxy_pool 移除 dead (%s): %s%s 剩余 %s"
+        % (reason or "dead", labels, extra, len(new_pool))
+    )
+    return len(removed)
+
+
 def mark_proxy_dead(url: str | None = None, reason: str = "") -> None:
     """将代理标为不可用（开页失败/探活失败）。url 默认当前池条目。"""
     target = str(url or current_pool_url() or last_expanded_proxy() or "").strip()
@@ -635,12 +760,16 @@ def mark_proxy_dead(url: str | None = None, reason: str = "") -> None:
         return
     # 同时标当前池原文与传入 URL（expanded 可能与原文不同）
     raw_current = current_pool_url()
+    to_remove: set[str] = set()
     with _health_lock:
         _mark_dead_locked(target)
+        to_remove.add(target)
         if raw_current and raw_current != target:
             _mark_dead_locked(raw_current)
+            to_remove.add(raw_current)
     if reason:
         _health_log("[!] 代理标 dead (%s): %s" % (reason, _safe_label(target)))
+    schedule_remove_dead_from_pool(to_remove, reason=reason or "mark_dead")
 
 
 def available_count() -> int:
@@ -718,6 +847,7 @@ def scan_status() -> dict:
 def reset_proxy_health_state() -> None:
     """测试用：清空健康缓存状态。"""
     global _scanning, _full_pass_done, _scan_thread, _health_logger
+    global _remove_flush_timer, _pending_remove_reason
     with _health_lock:
         _available.clear()
         _dead.clear()
@@ -727,6 +857,15 @@ def reset_proxy_health_state() -> None:
         _full_pass_done = False
         _scan_thread = None
     _health_logger = None
+    with _config_write_lock:
+        if _remove_flush_timer is not None:
+            try:
+                _remove_flush_timer.cancel()
+            except Exception:
+                pass
+            _remove_flush_timer = None
+        _pending_pool_remove.clear()
+        _pending_remove_reason = ""
 
 
 def start_background_scan(log=None, concurrency: int | None = None) -> None:
@@ -818,12 +957,17 @@ def start_background_scan(log=None, concurrency: int | None = None) -> None:
                         else:
                             _mark_dead_locked(url)
                             dead += 1
+                    if not ok:
+                        # 只删 dead，不把 available 写回 config
+                        schedule_remove_dead_from_pool(url, reason="health_scan")
                     if (alive + dead) % 20 == 0 or (alive + dead) == len(to_probe):
                         st = scan_status()
                         _health_log(
                             "[*] 代理探活进度: 已处理 %s/%s 可用=%s dead+=%s"
                             % (alive + dead, len(to_probe), st["available"], dead)
                         )
+            # 扫完立刻落盘，避免 debounce 期间进程退出丢删除
+            flush_pending_proxy_removals()
             _health_log(
                 "[*] 代理探活本轮完成: 新可用=%s 新dead=%s 当前可用=%s"
                 % (alive, dead, available_count())
@@ -834,6 +978,10 @@ def start_background_scan(log=None, concurrency: int | None = None) -> None:
                 if mark_full_pass:
                     _full_pass_done = True
                 _scan_thread = None
+            try:
+                flush_pending_proxy_removals()
+            except Exception:
+                pass
 
     t = threading.Thread(target=_run, name="proxy-health-scan", daemon=True)
     with _health_lock:
@@ -859,6 +1007,10 @@ def wait_until_available(cancel_callback=None, log=None, poll: float = 0.5) -> s
                 pass
 
     if not proxy_health_should_run():
+        # 本轮探活已把 proxy_pool 全删光时，应报无可用而非当作「未配置直连」
+        with _health_lock:
+            if _full_pass_done and not _available and (_dead or _probed):
+                raise NoAvailableProxyError("全池探活无可用代理（proxy_pool 已清空）")
         return ""
 
     start_background_scan(log=log)
@@ -880,9 +1032,11 @@ def wait_until_available(cancel_callback=None, log=None, poll: float = 0.5) -> s
             probed = len(_probed)
             size = len(_candidate_urls())
             avail = len(_available)
+            dead_n = len(_dead)
         if done and not scanning and avail == 0:
+            # pool 可能已在 flush 中被删空
             raise NoAvailableProxyError(
-                "全池探活无可用代理（已探 %s/%s）" % (probed, size)
+                "全池探活无可用代理（已探 %s/%s dead=%s）" % (probed, size or probed, dead_n)
             )
         now = time.time()
         if now - last_log >= 5.0:

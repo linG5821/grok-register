@@ -11,8 +11,11 @@ import proxy_manager as pm
 class ProxyHealthTests(unittest.TestCase):
     def setUp(self):
         self._prev = dict(app_config.config)
+        self._prev_persist = pm.persist_dead_pool_removals
         app_config.config.clear()
         app_config.config.update(app_config.DEFAULT_CONFIG)
+        # 默认不写真实 config.json
+        pm.persist_dead_pool_removals = False
         pm.reset_proxy_health_state()
         pm._current_session_id = ""
         pm._current_pool_url = ""
@@ -21,6 +24,7 @@ class ProxyHealthTests(unittest.TestCase):
 
     def tearDown(self):
         pm.reset_proxy_health_state()
+        pm.persist_dead_pool_removals = self._prev_persist
         app_config.config.clear()
         app_config.config.update(self._prev)
 
@@ -99,6 +103,57 @@ class ProxyHealthTests(unittest.TestCase):
         with pm._health_lock:
             self.assertNotIn("http://a:1", pm._available)
             self.assertIn("http://a:1", pm._dead)
+
+    def test_remove_dead_from_config_only_deletes(self):
+        """dead 只从 pool 删除，不覆盖 available。"""
+        app_config.config["proxy_pool"] = ["http://a:1", "http://b:2", "http://c:3"]
+        n = pm.remove_dead_from_config({"http://b:2"}, reason="unit")
+        self.assertEqual(n, 1)
+        self.assertEqual(app_config.config["proxy_pool"], ["http://a:1", "http://c:3"])
+
+    def test_remove_dead_noop_when_missing(self):
+        app_config.config["proxy_pool"] = ["http://a:1"]
+        n = pm.remove_dead_from_config({"http://nope:9"})
+        self.assertEqual(n, 0)
+        self.assertEqual(app_config.config["proxy_pool"], ["http://a:1"])
+
+    def test_mark_dead_schedules_pool_removal(self):
+        app_config.config["proxy_pool"] = ["http://a:1", "http://b:2"]
+        with pm._health_lock:
+            pm._available.append("http://a:1")
+        pm.mark_proxy_dead("http://a:1", reason="test")
+        # debounce 未 flush 前 pool 可能仍在；强制 flush
+        n = pm.flush_pending_proxy_removals()
+        self.assertEqual(n, 1)
+        self.assertEqual(app_config.config["proxy_pool"], ["http://b:2"])
+
+    def test_remove_dead_save_failure_keeps_memory_delete(self):
+        app_config.config["proxy_pool"] = ["http://a:1", "http://b:2"]
+        pm.persist_dead_pool_removals = True
+        with patch.object(app_config, "save_config", side_effect=RuntimeError("disk full")):
+            n = pm.remove_dead_from_config(["http://a:1"], reason="fail")
+        # save 失败返回 0，但内存 pool 已删（本进程仍跳过）
+        self.assertEqual(n, 0)
+        self.assertEqual(app_config.config["proxy_pool"], ["http://b:2"])
+
+    def test_health_scan_removes_dead_from_pool(self):
+        app_config.config["proxy_pool"] = [
+            "http://dead:1",
+            "http://good.example:9999",
+        ]
+
+        def probe(url, tcp_timeout=None, http_timeout=None):
+            return "good.example" in str(url)
+
+        with patch.object(pm, "probe_proxy_usable", side_effect=probe):
+            pm.start_background_scan(concurrency=2)
+            for _ in range(80):
+                if pm.scan_status()["full_pass_done"] and not pm.scan_status()["scanning"]:
+                    break
+                time.sleep(0.05)
+            # 扫完会 flush
+            self.assertNotIn("http://dead:1", app_config.config["proxy_pool"])
+            self.assertIn("http://good.example:9999", app_config.config["proxy_pool"])
 
     def test_rotate_prefers_available(self):
         app_config.config["proxy_pool"] = [
