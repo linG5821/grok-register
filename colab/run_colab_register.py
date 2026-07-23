@@ -100,8 +100,107 @@ def find_browser_binary() -> str:
     return ""
 
 
-def patch_browser_for_colab() -> None:
-    """仅在本进程内给 create_browser_options 打补丁，不修改源文件。"""
+def ensure_xvfb(display: str = ":99") -> bool:
+    """启动虚拟显示，使「有头」Chrome 在无 GUI 的 Colab 上可跑。
+
+    真 headless 常被 Cloudflare 直接拦；别人 Colab 能跑多半是 Xvfb + 有头 Chrome。
+    """
+    import shutil
+    import subprocess
+
+    if os.environ.get("DISPLAY"):
+        _log(f"[colab] DISPLAY 已存在: {os.environ['DISPLAY']}")
+        return True
+    xvfb = shutil.which("Xvfb")
+    if not xvfb:
+        _log("[colab] 未安装 Xvfb，请: apt-get install -y xvfb")
+        return False
+    # 已有进程则复用
+    try:
+        out = subprocess.check_output(["pgrep", "-a", "Xvfb"], text=True, stderr=subprocess.DEVNULL)
+        if display in out or "Xvfb" in out:
+            os.environ["DISPLAY"] = display
+            _log(f"[colab] 复用已有 Xvfb, DISPLAY={display}")
+            return True
+    except Exception:
+        pass
+    log_path = "/tmp/xvfb-colab.log"
+    try:
+        with open(log_path, "ab") as logf:
+            subprocess.Popen(
+                [xvfb, display, "-screen", "0", "1280x900x24", "-ac"],
+                stdout=logf,
+                stderr=logf,
+                start_new_session=True,
+            )
+        time.sleep(0.8)
+        os.environ["DISPLAY"] = display
+        _log(f"[colab] 已启动 Xvfb DISPLAY={display}")
+        return True
+    except Exception as exc:
+        _log(f"[colab] 启动 Xvfb 失败: {exc}")
+        return False
+
+
+def patch_cf_fail_fast() -> None:
+    """检测到 Cloudflare Attention Required 时立刻失败，避免空转找按钮。"""
+    try:
+        import registration_browser as rb
+    except Exception as exc:
+        _log(f"[colab] 无法 patch CF 检测: {exc}")
+        return
+
+    original = getattr(rb, "click_email_signup_button", None)
+    if not callable(original):
+        return
+
+    def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=None):
+        page = getattr(rb, "page", None)
+        if page is not None:
+            try:
+                html = ""
+                try:
+                    html = str(page.html or "")[:4000]
+                except Exception:
+                    pass
+                title = ""
+                try:
+                    title = str(page.title or "")
+                except Exception:
+                    try:
+                        title = str(page.run_js("return document.title") or "")
+                    except Exception:
+                        title = ""
+                blob = (title + "\n" + html).lower()
+                if (
+                    "attention required" in blob
+                    or "cf-error-details" in blob
+                    or "sorry, you have been blocked" in blob
+                    or ("cloudflare" in blob and "just a moment" in blob)
+                ):
+                    msg = (
+                        "Cloudflare 拦截页（Attention Required / blocked），"
+                        "当前无注册按钮可点。请换 Runtime 或改用住宅代理。"
+                    )
+                    if log_callback:
+                        log_callback(f"[!] {msg} title={title!r}")
+                    raise RuntimeError(msg)
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
+        return original(timeout=timeout, log_callback=log_callback, cancel_callback=cancel_callback)
+
+    rb.click_email_signup_button = click_email_signup_button
+    _log("[colab] 已启用 Cloudflare 拦截早失败")
+
+
+def patch_browser_for_colab(*, use_headless: bool = False) -> None:
+    """仅在本进程内给 create_browser_options 打补丁，不修改源文件。
+
+    默认 **有头 + Xvfb**（use_headless=False）：真 headless 极易被 CF 拦，
+    且 Chrome 在 headless 下通常不加载扩展。
+    """
     import browser_runtime as br
 
     browser_bin = find_browser_binary()
@@ -112,9 +211,25 @@ def patch_browser_for_colab() -> None:
         _log("  !apt-get install -y -qq ./google-chrome-stable_current_amd64.deb")
         raise RuntimeError("browser executable not found")
 
+    if not use_headless:
+        if not ensure_xvfb():
+            _log("[colab] 无 Xvfb 时回退 headless（更易被 CF 拦）")
+            use_headless = True
+    else:
+        _log("[colab] 使用真 headless（不推荐，易被 Cloudflare 拦）")
+
+    # 扩展：有头模式才能加载；路径按项目根解析
+    ext = ROOT / "turnstilePatch"
+    if not ext.is_dir():
+        _log(f"[colab] 警告: 未找到 turnstilePatch 扩展目录: {ext}")
+        _log("[colab] 本地若有该目录请放进仓库根，或接受无扩展过盾更难")
+
     original = br.create_browser_options
 
     def create_browser_options(browser_proxy="", extension_path=None):
+        # 优先用仓库 turnstilePatch
+        if extension_path is None and ext.is_dir():
+            extension_path = str(ext)
         options = original(browser_proxy=browser_proxy, extension_path=extension_path)
         try:
             options.set_browser_path(browser_bin)
@@ -124,22 +239,53 @@ def patch_browser_for_colab() -> None:
         for arg in (
             "--no-sandbox",
             "--disable-dev-shm-usage",
-            "--disable-gpu",
             "--window-size=1280,900",
             "--disable-blink-features=AutomationControlled",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--lang=en-US",
         ):
             try:
                 options.set_argument(arg)
             except Exception:
                 pass
-        try:
-            options.headless(True)
-        except Exception:
+        # 有头：明确关掉 headless；headless 才开
+        if use_headless:
             try:
-                options.set_argument("--headless=new")
+                options.headless(True)
+            except Exception:
+                try:
+                    options.set_argument("--headless=new")
+                except Exception:
+                    pass
+            try:
+                options.set_argument("--disable-gpu")
             except Exception:
                 pass
-        _log(f"[colab] browser: path={browser_bin} headless+no-sandbox")
+        else:
+            try:
+                options.headless(False)
+            except Exception:
+                pass
+            # 去掉可能被默认带上的 headless 参数
+            try:
+                args = list(getattr(options, "arguments", []) or [])
+                cleaned = [a for a in args if "headless" not in str(a).lower()]
+                if cleaned != args and hasattr(options, "set_argument"):
+                    # ChromiumOptions 可能无法直接删参数；尽力 set headless False 即可
+                    pass
+            except Exception:
+                pass
+        try:
+            if hasattr(options, "set_user_agent"):
+                options.set_user_agent(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                )
+        except Exception:
+            pass
+        mode = "headless" if use_headless else f"headed+Xvfb(DISPLAY={os.environ.get('DISPLAY')})"
+        _log(f"[colab] browser: path={browser_bin} mode={mode}")
         return options
 
     br.create_browser_options = create_browser_options
@@ -294,7 +440,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--skip-browser-patch",
         action="store_true",
-        help="不打 headless 补丁（调试用）",
+        help="不打浏览器补丁（调试用）",
+    )
+    parser.add_argument(
+        "--true-headless",
+        action="store_true",
+        help="真 headless（默认用 Xvfb 有头；真 headless 更易被 CF 拦）",
     )
     args = parser.parse_args(argv)
 
@@ -302,10 +453,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.skip_browser_patch:
         try:
-            patch_browser_for_colab()
+            patch_browser_for_colab(use_headless=bool(args.true_headless))
+            patch_cf_fail_fast()
         except Exception as exc:
             _log(f"[colab] browser patch 失败: {exc}")
-            _log("[colab] 请确认仓库完整且已安装 DrissionPage")
+            _log("[colab] 请确认仓库完整、已装 Chrome/Xvfb/DrissionPage")
             return 2
 
     egress = probe_egress()
