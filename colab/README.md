@@ -44,15 +44,25 @@ python colab/run_colab_register.py --count 1 --rotate-if-hosting
 
 ### 若报 `No module named 'app_config'`
 
-1. 确认 clone 的是 **含 `colab/` 的完整仓库**（推荐 `linG5821/grok-register`，不是只有部分文件的目录）
+1. 确认 clone 的是 **含 `colab/` 的完整仓库**（推荐 `linG5821/grok-register`）
 2. 在 Colab 执行：
    ```bash
-   !ls /content/grok-register/app_config.py
-   !rm -rf /content/grok-register   # 半拉子目录
+   %cd /content
+   !rm -rf /content/grok-register
    !git clone --depth 1 -b main https://github.com/linG5821/grok-register.git /content/grok-register
    !cd /content/grok-register && PYTHONPATH=/content/grok-register python colab/run_colab_register.py --count 1
    ```
-3. 入口脚本已会自动 `sys.path.insert` + 探测项目根；仍失败多半是 clone 路径不对
+
+### 若报 `getcwd: cannot access parent directories` / `FileNotFoundError` in pip
+
+说明 **当前 notebook 工作目录已被删掉**（例如先 `rm -rf /content/grok-register` 而 kernel 还停在里面）。
+
+**立刻修复（先跑这一格）：**
+```python
+%cd /content
+```
+然后再跑安装依赖 / clone。  
+**不要**在「当前目录就是 grok-register」时执行 `!rm -rf /content/grok-register`；应先 `%cd /content` 再删。
 
 ## 默认策略
 
