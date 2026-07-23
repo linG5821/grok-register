@@ -76,14 +76,51 @@ def ensure_project_root() -> Path:
     return ROOT
 
 
+def find_browser_binary() -> str:
+    """Colab/Linux 常见 Chromium/Chrome 路径。"""
+    import shutil
+
+    candidates = [
+        os.environ.get("CHROME_BIN") or "",
+        os.environ.get("BROWSER_PATH") or "",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+        "/snap/bin/chromium",
+        shutil.which("google-chrome-stable") or "",
+        shutil.which("google-chrome") or "",
+        shutil.which("chromium-browser") or "",
+        shutil.which("chromium") or "",
+    ]
+    for path in candidates:
+        text = str(path or "").strip()
+        if text and os.path.isfile(text) and os.access(text, os.X_OK):
+            return text
+    return ""
+
+
 def patch_browser_for_colab() -> None:
     """仅在本进程内给 create_browser_options 打补丁，不修改源文件。"""
     import browser_runtime as br
+
+    browser_bin = find_browser_binary()
+    if not browser_bin:
+        _log("[colab] 未找到 Chrome/Chromium 可执行文件")
+        _log("[colab] 请先运行安装格，或手动：")
+        _log("  !wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb")
+        _log("  !apt-get install -y -qq ./google-chrome-stable_current_amd64.deb")
+        raise RuntimeError("browser executable not found")
 
     original = br.create_browser_options
 
     def create_browser_options(browser_proxy="", extension_path=None):
         options = original(browser_proxy=browser_proxy, extension_path=extension_path)
+        try:
+            options.set_browser_path(browser_bin)
+        except Exception as exc:
+            _log(f"[colab] set_browser_path 失败: {exc}")
+            raise
         for arg in (
             "--no-sandbox",
             "--disable-dev-shm-usage",
@@ -102,10 +139,11 @@ def patch_browser_for_colab() -> None:
                 options.set_argument("--headless=new")
             except Exception:
                 pass
-        _log("[colab] browser: headless + no-sandbox 已启用")
+        _log(f"[colab] browser: path={browser_bin} headless+no-sandbox")
         return options
 
     br.create_browser_options = create_browser_options
+    _log(f"[colab] 已绑定浏览器: {browser_bin}")
 
 
 def force_no_proxy_config(cfg: dict) -> dict:

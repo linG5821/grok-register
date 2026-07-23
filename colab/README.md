@@ -83,7 +83,7 @@ python colab/run_colab_register.py --count 1 --rotate-if-hosting
 
 | 现象 | 处理 |
 |------|------|
-| Chrome/Chromium 起不来 | 重跑 notebook 安装依赖格；确认 `chromium-browser` 或 `google-chrome-stable` 已装 |
+| Chrome/Chromium 起不来 / `browser executable file path cannot be found` | 重跑安装格（会装 **google-chrome-stable**）；确认 `!which google-chrome-stable` 有输出；入口会 `set_browser_path` |
 | Turnstile / 资料页卡住 | Colab 机房 IP 风控；换 Runtime 或改回本地住宅代理 |
 | Build 403 / bot_flag | 与出口 ASN 相关；换机后新号再试，已 flag 号无法救 |
 | 邮箱 API 失败 | `config.json` 里邮箱密钥/域名是否填对；Colab 能否访问你的邮箱服务 |
