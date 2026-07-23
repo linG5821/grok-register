@@ -30,14 +30,29 @@ Colab 跑在 Google 机器上，**出口就是 Google 机房 IP**，更容易被
 
 ```bash
 # 装系统依赖（Chrome 相关，见 notebook 第 1 格）
+# 务必带 PYTHONPATH，否则会 No module named app_config
+cd /content/grok-register   # 或你的 clone 路径
+export PYTHONPATH=/content/grok-register
 python colab/run_colab_register.py --count 3
 
-# 每 2 个号尝试断开 Runtime 换机（断后需手动重连再跑）
+# 每 2 个号尝试 unassign Runtime 换机（断后需手动重连再跑）
 python colab/run_colab_register.py --count 6 --rotate-after 2
 
 # 若启动时就是机房 ASN，直接请求换机
 python colab/run_colab_register.py --count 1 --rotate-if-hosting
 ```
+
+### 若报 `No module named 'app_config'`
+
+1. 确认 clone 的是 **含 `colab/` 的完整仓库**（推荐 `linG5821/grok-register`，不是只有部分文件的目录）
+2. 在 Colab 执行：
+   ```bash
+   !ls /content/grok-register/app_config.py
+   !rm -rf /content/grok-register   # 半拉子目录
+   !git clone --depth 1 -b main https://github.com/linG5821/grok-register.git /content/grok-register
+   !cd /content/grok-register && PYTHONPATH=/content/grok-register python colab/run_colab_register.py --count 1
+   ```
+3. 入口脚本已会自动 `sys.path.insert` + 探测项目根；仍失败多半是 clone 路径不对
 
 ## 默认策略
 

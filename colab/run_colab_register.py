@@ -21,6 +21,7 @@ import traceback
 from pathlib import Path
 
 
+# 可能被 ensure_project_root 纠正（嵌套 clone / 工作目录不同时）
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -28,10 +29,51 @@ def _log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def ensure_project_root() -> None:
+def ensure_project_root() -> Path:
+    """定位含 app_config.py 的项目根，chdir + 插入 sys.path。失败直接退出。"""
+    global ROOT
+    candidates = [
+        Path(__file__).resolve().parents[1],
+        Path.cwd(),
+        Path.cwd() / "grok-register",
+        Path("/content/grok-register"),
+        Path("/content") / "grok-register",
+        Path(__file__).resolve().parents[2] / "grok-register",
+    ]
+    seen: set[str] = set()
+    found: Path | None = None
+    for cand in candidates:
+        try:
+            root = cand.resolve()
+        except Exception:
+            continue
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        if (root / "app_config.py").is_file() and (root / "browser_runtime.py").is_file():
+            found = root
+            break
+    if found is None:
+        _log("[colab] 找不到项目根（需要 app_config.py + browser_runtime.py）")
+        _log(f"[colab] __file__={__file__}")
+        _log(f"[colab] cwd={os.getcwd()}")
+        _log(f"[colab] 已试: {list(seen)[:8]}")
+        _log("[colab] 请确认已 clone 完整仓库到 /content/grok-register")
+        raise SystemExit(2)
+    ROOT = found
     os.chdir(ROOT)
-    if str(ROOT) not in sys.path:
-        sys.path.insert(0, str(ROOT))
+    root_s = str(ROOT)
+    # 始终插到最前，避免被其它路径遮蔽
+    while root_s in sys.path:
+        sys.path.remove(root_s)
+    sys.path.insert(0, root_s)
+    os.environ["PYTHONPATH"] = root_s + (
+        os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else ""
+    )
+    _log(f"[colab] project root = {ROOT}")
+    _log(f"[colab] sys.path[0] = {sys.path[0]}")
+    return ROOT
 
 
 def patch_browser_for_colab() -> None:
@@ -219,13 +261,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     ensure_project_root()
-    _log(f"[colab] project root = {ROOT}")
 
     if not args.skip_browser_patch:
         try:
             patch_browser_for_colab()
         except Exception as exc:
             _log(f"[colab] browser patch 失败: {exc}")
+            _log("[colab] 请确认仓库完整且已安装 DrissionPage")
+            return 2
 
     egress = probe_egress()
     if egress.get("ok"):
